@@ -45,13 +45,29 @@ class TestIngest(unittest.TestCase):
 
     def test_quote_status_is_upserted_not_duplicated(self):
         self._write([QUOTE], [])
-        ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        report1 = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
         updated = {**QUOTE, "status": "accepted"}
         self._write([updated], [])
-        ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        report2 = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
         rows = self.conn.execute("SELECT status FROM quotes WHERE id = 'Q-1'").fetchall()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "accepted")
+        # Updating a quote across separate ingest runs is normal upsert
+        # behavior, not a collision -- must not be flagged as a warning.
+        self.assertEqual(report1.warnings, [])
+        self.assertEqual(report2.warnings, [])
+
+    def test_duplicate_quote_id_within_one_file_is_flagged_not_silent(self):
+        clobbered = {**QUOTE, "amount": 1}
+        winner = {**QUOTE, "amount": 2}
+        self._write([clobbered, winner], [])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(len(report.warnings), 1)
+        self.assertIn("Q-1", report.warnings[0])
+        self.assertIn("more than once", report.warnings[0])
+        # last-write-wins is still the applied behavior -- just no longer silent
+        amount = self.conn.execute("SELECT amount FROM quotes WHERE id = 'Q-1'").fetchone()[0]
+        self.assertEqual(amount, 2)
 
     def test_malformed_json_line_is_skipped_not_fatal(self):
         good = json.dumps({"event_id": "e1", "type": "quote_viewed", "quote_id": "Q-1", "timestamp": "2026-08-02T00:00:00Z"})

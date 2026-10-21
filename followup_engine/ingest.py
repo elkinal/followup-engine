@@ -32,12 +32,18 @@ class IngestReport:
     events_inserted: int = 0
     events_duplicate: int = 0
     events_skipped: list[str] = field(default_factory=list)
+    # Rows that were applied (not skipped) but are worth a human's attention
+    # -- e.g. the same quote id appearing twice in one quotes.json, which
+    # silently resolves last-write-wins via the upsert and would otherwise
+    # leave no trace that it happened at all.
+    warnings: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         return (
             f"quotes: {self.quotes_upserted} upserted, {self.quotes_skipped} skipped | "
             f"events: {self.events_inserted} inserted, {self.events_duplicate} duplicate, "
             f"{len(self.events_skipped)} skipped"
+            + (f" | {len(self.warnings)} warning(s)" if self.warnings else "")
         )
 
 
@@ -116,11 +122,23 @@ def _load_json_list(path: str | Path, what: str) -> list:
 def ingest_quotes(conn: sqlite3.Connection, path: str | Path) -> IngestReport:
     report = IngestReport()
     data = _load_json_list(path, "quotes")
-    for row in data:
+    seen_in_batch: dict[str, int] = {}  # id -> line index, to spot a collision within THIS file
+    for i, row in enumerate(data):
         params = _normalize_quote_row(row)
         if params is None:
             report.quotes_skipped += 1
             continue
+        # A quote id reappearing across separate ingest runs is normal (the
+        # quote's status/amount/etc. legitimately changed and we're meant to
+        # upsert it) -- but the same id appearing twice in one quotes.json
+        # file is a different thing: the upsert will silently apply
+        # last-write-wins with zero trace that it happened, unless flagged.
+        if params["id"] in seen_in_batch:
+            report.warnings.append(
+                f"quote id {params['id']!r} appears more than once in this file "
+                f"(entry {seen_in_batch[params['id']]} and {i}) -- last one wins"
+            )
+        seen_in_batch[params["id"]] = i
         try:
             conn.execute(
                 """

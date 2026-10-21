@@ -195,6 +195,27 @@ subtler correctness bug plus more CLI robustness gaps:
   (`test_cli.py`: clean-error-message tests plus a full ingest -> draft ->
   approve -> send -> outbox run through the actual CLI entry point).
 
+A final completeness pass (re-checking repo hygiene and re-reading every
+file fresh rather than trusting my own summary of it) found two more:
+
+- **`.gitignore` didn't cover the `followup.db-wal`/`followup.db-shm`
+  sidecar files WAL mode creates.** They're normally cleaned up on a clean
+  connection close, but confirmed they exist while a connection is open and
+  would be left behind (and un-ignored) if a process were ever killed
+  mid-operation. Added to `.gitignore`.
+- **The same "silently reused identity" bug I'd already fixed for
+  `event_id` also existed for quote `id`s, unfixed.** Two quotes sharing an
+  `id` within one `quotes.json` file silently resolved last-write-wins via
+  the upsert, reported as "2 upserted" with zero indication one had just
+  clobbered the other. I'd noticed and mentioned this verbally earlier in
+  the process but never actually fixed or written it down -- caught on a
+  final re-check that specifically looked for exactly that kind of gap.
+  Fixed the same way as the `event_id` case: still applies last-write-wins
+  (that's a reasonable default), but now flags it as a warning instead of
+  staying silent. A normal re-ingest that legitimately updates a quote's
+  status across *separate* runs is unaffected -- only a collision *within
+  the same file* triggers it.
+
 A third pass then implemented the four items from the previous pass that
 were "found but not fixed" above:
 

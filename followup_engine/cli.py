@@ -30,6 +30,8 @@ def cmd_ingest(args):
     print(report.summary())
     for msg in report.events_skipped:
         print(f"  skipped: {msg}")
+    for msg in report.warnings:
+        print(f"  warning: {msg}")
 
 
 def cmd_candidates(args):
