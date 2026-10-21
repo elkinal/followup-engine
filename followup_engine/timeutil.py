@@ -8,7 +8,14 @@ from datetime import datetime, timezone
 
 
 def parse_ts(value: str) -> datetime:
-    """Parse an ISO-8601 'Z'-suffixed timestamp into an aware UTC datetime."""
+    """Parse an ISO-8601 'Z'-suffixed timestamp into an aware UTC datetime.
+
+    Raises TypeError/ValueError (never AttributeError or anything else) for
+    any invalid input, including non-string values like a JSON null, so
+    callers can catch a single, consistent pair of exception types.
+    """
+    if not isinstance(value, str):
+        raise TypeError(f"timestamp must be a string, got {type(value).__name__}: {value!r}")
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
     dt = datetime.fromisoformat(value)

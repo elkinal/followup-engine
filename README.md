@@ -89,12 +89,22 @@ touchpoint from us; I didn't want a passive view to quietly suppress "it's
 been N days, say something" forever.
 
 Guardrails (enforced in `service.py`, the only module that writes to
-`messages`/`outbox`):
+`messages`/`outbox` -- plus, for the first one, in the schema itself):
 
-- **Never message an `accepted`/`dismissed` quote** -- checked both when
-  generating candidates (`policy.py` only looks at `status = 'open'`) and
-  again at send time, re-reading the quote's current status, in case it
-  changed between draft creation and approval (tested in
+- **Never message an `accepted`/`dismissed` quote** -- checked when
+  generating candidates (`policy.py` only looks at `status = 'open'`), again
+  in Python at send time in case it changed between draft and approval, and
+  as a hard constraint in `db.py`: three triggers (`block_draft_for_non_open_quote`,
+  `block_approve_for_non_open_quote`, `block_send_for_non_open_quote`) make
+  it impossible to insert a draft, approve one, or write an `outbox` row for
+  a quote that isn't open, independent of what any Python code path checks.
+  I added these after first building the guardrail only in `service.py` --
+  that's correct for every path that goes through it today, but a schema
+  constraint is the only thing that stays true even if a future code path
+  (or a bug) writes to these tables directly. `service.py` catches the
+  resulting `IntegrityError` and turns it into the same clean
+  `GuardrailViolation` a caller would get from the Python-level check, so
+  nothing leaks a raw SQLite error (tested in `test_db_constraints.py` and
   `test_guardrails.py`).
 - **Cooldown, by customer phone number, not by quote** -- the seed data has
   two separate open quotes for the same customer (`Q-1003`/`Q-1025`, Karen
@@ -125,6 +135,39 @@ an open *competing* quote elsewhere (if discoverable), the tech's own
 preference/relationship with that customer, time-of-day/day-of-week (don't
 text at 11pm), and outcome feedback (did past follow-ups on similar quotes
 actually convert, to let the thresholds self-tune over time).
+
+### Gaps I found and either fixed or consciously left
+
+Auditing my own guardrails after the first pass turned up a few real bugs,
+which I fixed and backed with tests (`test_db_constraints.py`,
+`test_ingest.py`, `test_drafting.py`, `test_timeutil.py`):
+
+- **Ingest crashed, and lost already-processed rows, on a malformed value**
+  (e.g. a present-but-`null` `amount`, an unparseable `created_at`) instead
+  of skipping that one row -- `ingest.py` now validates field *values*, not
+  just key presence, and wraps each row's insert so one bad record can never
+  take the rest of the batch down with it.
+- **`parse_ts(None)` raised `AttributeError`** instead of a catchable
+  `TypeError`/`ValueError`, which meant a literal JSON `null` timestamp
+  slipped past the fix above. Fixed in `timeutil.py`.
+- **`draft_message()` crashed on a blank/whitespace-only `customer_name`**
+  (`"".split()[0]` -> `IndexError`). Now falls back to a generic greeting.
+- **The "never message a non-open quote" guardrail was Python-only.** Added
+  as schema-level triggers (see above) so it's structurally impossible, not
+  just checked.
+
+Found but **not** fixed, since they're either out of scope for an MVP or
+need a product decision I can't make unilaterally:
+
+- `customer_phone` isn't normalized, so the same person with two differently
+  formatted phone numbers would bypass the cross-quote cooldown guardrail.
+- Our outbound `send()` always defaults to SMS; it doesn't look at which
+  channel (`sms`/`email`) the customer has actually used before.
+- No record of *who* approved a message -- relevant for an audit trail once
+  this is multi-user, not just a single owner.
+- SQLite is single-writer; concurrent CLI invocations can hit "database is
+  locked" with no retry. Fine for one shop's local MVP, not for the 50-shop
+  scale discussed below.
 
 ## Scaling to a parent company with 50 shops
 

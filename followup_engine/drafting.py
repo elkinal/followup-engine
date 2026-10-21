@@ -37,10 +37,15 @@ _DEFAULT_TEMPLATE = (
 )
 
 
+def _first_name(name: str) -> str:
+    parts = name.split()
+    return parts[0] if parts else "there"  # blank/whitespace-only name: generic greeting, don't crash
+
+
 def draft_message(candidate: Candidate) -> str:
     template = _TEMPLATES.get(candidate.reason_code, _DEFAULT_TEMPLATE)
     return template.format(
-        customer_name=candidate.customer_name.split()[0],
+        customer_name=_first_name(candidate.customer_name),
         tech_name=candidate.tech_name,
         amount=candidate.amount,
     )

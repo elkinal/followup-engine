@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS quotes (
     customer_name TEXT NOT NULL,
     customer_phone TEXT NOT NULL,
     tech_name TEXT NOT NULL,
-    amount INTEGER NOT NULL,
+    amount INTEGER NOT NULL CHECK (amount >= 0),
     status TEXT NOT NULL CHECK (status IN ('open', 'accepted', 'dismissed')),
     created_at TEXT NOT NULL,
     last_contact_at TEXT
@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS quotes (
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY,
     type TEXT NOT NULL,
-    quote_id TEXT NOT NULL,
+    quote_id TEXT NOT NULL REFERENCES quotes(id),
     timestamp TEXT NOT NULL,
     channel TEXT,
     direction TEXT,
@@ -55,7 +55,14 @@ CREATE TABLE IF NOT EXISTS messages (
     status TEXT NOT NULL CHECK (status IN ('draft', 'approved', 'sent', 'failed')),
     created_at TEXT NOT NULL,
     approved_at TEXT,
-    sent_at TEXT
+    sent_at TEXT,
+    -- A message can't reach approved/sent/failed without having been
+    -- approved first (failed only happens to a previously-approved send
+    -- attempt -- see service.send()), and can't be 'sent' without a
+    -- sent_at. These make a half-populated audit trail impossible rather
+    -- than just "shouldn't happen".
+    CHECK (status = 'draft' OR approved_at IS NOT NULL),
+    CHECK (status != 'sent' OR sent_at IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_quote ON messages(quote_id);
 CREATE INDEX IF NOT EXISTS idx_messages_phone ON messages(customer_phone);
@@ -65,6 +72,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_open_message_per_quote
     ON messages(quote_id)
     WHERE status IN ('draft', 'approved');
 
+-- Hard guardrail, enforced at the schema level so it cannot be bypassed by
+-- any future code path: a message can never be drafted or approved for a
+-- quote that isn't open, independent of whatever policy.py/service.py
+-- happen to check in Python. (status IS NOT 'open' also catches an
+-- unrecognized/missing quote_id, since the subquery then returns NULL.)
+CREATE TRIGGER IF NOT EXISTS block_draft_for_non_open_quote
+BEFORE INSERT ON messages
+FOR EACH ROW
+WHEN (SELECT status FROM quotes WHERE id = NEW.quote_id) IS NOT 'open'
+BEGIN
+    SELECT RAISE(ABORT, 'quote is not open: cannot create a message for it');
+END;
+
+CREATE TRIGGER IF NOT EXISTS block_approve_for_non_open_quote
+BEFORE UPDATE OF status ON messages
+FOR EACH ROW
+WHEN NEW.status = 'approved' AND (SELECT status FROM quotes WHERE id = NEW.quote_id) IS NOT 'open'
+BEGIN
+    SELECT RAISE(ABORT, 'quote is not open: cannot approve a message for it');
+END;
+
 -- The "send" side effect. message_id is the idempotency key: sending is
 -- `INSERT OR IGNORE` into this table, so retrying a send (crash, timeout,
 -- at-least-once webhook redelivery, re-running the whole engine) can never
@@ -72,12 +100,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_open_message_per_quote
 -- provider would sit behind write_outbox() in service.py.
 CREATE TABLE IF NOT EXISTS outbox (
     message_id TEXT PRIMARY KEY REFERENCES messages(id),
-    quote_id TEXT NOT NULL,
+    quote_id TEXT NOT NULL REFERENCES quotes(id),
     customer_phone TEXT NOT NULL,
     channel TEXT NOT NULL,
     body TEXT NOT NULL,
     sent_at TEXT NOT NULL
 );
+
+-- Same hard guardrail as above, at the actual send boundary. service.send()
+-- already re-checks quote status in Python before this insert, so in normal
+-- operation this trigger never fires -- it exists purely so a future bug or
+-- a direct write can never produce a real outbound send for a closed quote.
+CREATE TRIGGER IF NOT EXISTS block_send_for_non_open_quote
+BEFORE INSERT ON outbox
+FOR EACH ROW
+WHEN (SELECT status FROM quotes WHERE id = NEW.quote_id) IS NOT 'open'
+BEGIN
+    SELECT RAISE(ABORT, 'quote is not open: refusing to send');
+END;
 """
 
 

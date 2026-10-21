@@ -80,6 +80,44 @@ class TestPolicyRules(unittest.TestCase):
         self.assertIsNone(sig.last_viewed_at)
         self.assertEqual(reason_codes(self.conn)["Q-1"], "stale_general")
 
+    def test_full_priority_order_across_all_four_tiers(self):
+        # One quote per tier, plus a decoy that shouldn't qualify at all.
+        # This pins down the *final sorted order*, not just which rule fires
+        # for each quote in isolation -- a sort-key regression (e.g. a sign
+        # flip) would only be caught by an assertion like this one.
+        insert_quote(self.conn, "Q-REPLY", amount=1000, created_at="2026-07-01T00:00:00Z")
+        insert_event(self.conn, "e1", "customer_replied", "Q-REPLY", "2026-08-15T00:00:00Z")
+
+        insert_quote(self.conn, "Q-VIEW", amount=1000, created_at="2026-07-01T00:00:00Z")
+        insert_event(self.conn, "e2", "quote_viewed", "Q-VIEW", "2026-08-15T12:00:00Z")
+
+        insert_quote(self.conn, "Q-BIG", amount=10000, created_at="2026-08-10T00:00:00Z")
+
+        insert_quote(self.conn, "Q-GEN", amount=200, created_at="2026-08-05T00:00:00Z")
+
+        insert_quote(self.conn, "Q-TOO-NEW", amount=10000, created_at="2026-08-15T18:00:00Z")
+
+        ordered_ids = [c.quote_id for c in policy.get_candidates(self.conn, NOW)]
+        self.assertEqual(ordered_ids, ["Q-REPLY", "Q-VIEW", "Q-BIG", "Q-GEN"])
+        self.assertNotIn("Q-TOO-NEW", ordered_ids)
+
+    def test_more_recently_viewed_quote_sorts_before_an_older_view(self):
+        insert_quote(self.conn, "Q-OLDER-VIEW", created_at="2026-07-01T00:00:00Z")
+        insert_event(self.conn, "e1", "quote_viewed", "Q-OLDER-VIEW", "2026-08-14T00:00:00Z")  # ~2 days ago
+        insert_quote(self.conn, "Q-NEWER-VIEW", created_at="2026-07-01T00:00:00Z")
+        insert_event(self.conn, "e2", "quote_viewed", "Q-NEWER-VIEW", "2026-08-15T18:00:00Z")  # 6h ago
+
+        ordered_ids = [c.quote_id for c in policy.get_candidates(self.conn, NOW)]
+        self.assertEqual(ordered_ids.index("Q-NEWER-VIEW"), 0)
+        self.assertEqual(ordered_ids.index("Q-OLDER-VIEW"), 1)
+
+    def test_stale_general_boundary_is_inclusive(self):
+        insert_quote(self.conn, "Q-EXACT", amount=100, created_at="2026-08-09T00:00:00Z")  # exactly 7d before NOW
+        insert_quote(self.conn, "Q-JUST-UNDER", amount=100, created_at="2026-08-09T00:00:01Z")  # 1s short of 7d
+        codes = reason_codes(self.conn)
+        self.assertEqual(codes["Q-EXACT"], "stale_general")
+        self.assertNotIn("Q-JUST-UNDER", codes)
+
 
 if __name__ == "__main__":
     unittest.main()

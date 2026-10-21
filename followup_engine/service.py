@@ -57,10 +57,15 @@ def create_drafts(conn: sqlite3.Connection, now: datetime) -> DraftResult:
                 """,
                 (message_id, c.quote_id, c.customer_phone, c.reason_code, c.reason, body, now_str),
             )
-        except sqlite3.IntegrityError:
-            # Another draft/approved message is already outstanding for this
-            # quote (e.g. this function was called twice for the same run).
-            result.skipped.append((c.quote_id, "already has an open draft"))
+        except sqlite3.IntegrityError as e:
+            # Two cases land here: another draft/approved message is already
+            # outstanding for this quote (e.g. this function ran twice for
+            # the same batch), or the `block_draft_for_non_open_quote`
+            # trigger rejected it because the quote closed between
+            # get_candidates() and this insert (a race condition backstop --
+            # policy.py already filters to open quotes, so this is rare).
+            reason = "quote no longer open" if "not open" in str(e) else "already has an open draft"
+            result.skipped.append((c.quote_id, reason))
             continue
 
         # A draft for this customer counts toward their own cooldown for the
@@ -81,10 +86,18 @@ def approve(conn: sqlite3.Connection, message_id: str, now: datetime) -> None:
         raise GuardrailViolation(
             f"message {message_id} is '{row['status']}', not 'draft' -- cannot approve"
         )
-    conn.execute(
-        "UPDATE messages SET status = 'approved', approved_at = ? WHERE id = ?",
-        (format_ts(now), message_id),
-    )
+    try:
+        conn.execute(
+            "UPDATE messages SET status = 'approved', approved_at = ? WHERE id = ?",
+            (format_ts(now), message_id),
+        )
+    except sqlite3.IntegrityError:
+        # block_approve_for_non_open_quote trigger: the quote closed between
+        # draft creation and this approval.
+        conn.rollback()
+        raise GuardrailViolation(
+            f"quote {row['quote_id']} is no longer open -- cannot approve message {message_id}"
+        )
     conn.commit()
 
 
