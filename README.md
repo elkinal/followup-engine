@@ -28,6 +28,8 @@ python3 -m followup_engine.cli draft --now 2026-08-16T00:00:00Z
 python3 -m followup_engine.cli drafts --status draft
 
 # 5. Human approves, then sends (two separate, deliberate steps)
+#    approve defaults --by to your OS username; send defaults --channel to
+#    whichever channel the draft was written for (see "follow-up policy").
 python3 -m followup_engine.cli approve <message_id>
 python3 -m followup_engine.cli send <message_id>
 
@@ -42,7 +44,12 @@ python3 -m unittest discover -s tests -v
 ```
 
 `followup.db` is created next to this README on first `ingest` and is safe
-to delete (`rm followup.db`) to start over.
+to delete (`rm followup.db`) to start over. Schema changes in this project
+only apply via `CREATE TABLE IF NOT EXISTS`, so an existing `followup.db`
+from before a schema change (e.g. the `channel`/`approved_by` columns added
+in the audit section below) won't pick it up automatically -- delete it and
+re-ingest. A real deployment would need actual migrations; out of scope
+here.
 
 ## The follow-up policy and why
 
@@ -188,18 +195,49 @@ subtler correctness bug plus more CLI robustness gaps:
   (`test_cli.py`: clean-error-message tests plus a full ingest -> draft ->
   approve -> send -> outbox run through the actual CLI entry point).
 
-Found but **not** fixed, since they're either out of scope for an MVP or
-need a product decision I can't make unilaterally:
+A third pass then implemented the four items from the previous pass that
+were "found but not fixed" above:
 
-- `customer_phone` isn't normalized, so the same person with two differently
-  formatted phone numbers would bypass the cross-quote cooldown guardrail.
-- Our outbound `send()` always defaults to SMS; it doesn't look at which
-  channel (`sms`/`email`) the customer has actually used before.
-- No record of *who* approved a message -- relevant for an audit trail once
-  this is multi-user, not just a single owner.
-- SQLite is single-writer; concurrent CLI invocations can hit "database is
-  locked" with no retry. Fine for one shop's local MVP, not for the 50-shop
-  scale discussed below.
+- **Phone numbers are now normalized at ingest** (`phone.py`:
+  `normalize_phone`) to an E.164-ish canonical form before being stored, so
+  `"+19175552003"` and `"(917) 555-2003"` for the same customer resolve to
+  one identity and the cross-quote cooldown guardrail can't be bypassed by a
+  formatting difference. This is a simple regex-based, US-centric
+  normalizer, not a full i18n phone library -- a real deployment serving
+  non-US shops should replace it with one (e.g. `libphonenumber`); I called
+  this out explicitly rather than let a hand-rolled heuristic look more
+  authoritative than it is.
+- **Outbound channel is now chosen per-customer, not hardcoded to SMS.**
+  `policy.py`'s `QuoteSignals.preferred_channel` looks at the customer's own
+  event history -- their most recent reply's channel wins (they chose it
+  themselves), falling back to whichever channel we last messaged them on,
+  falling back to SMS only if there's no history at all. The chosen channel
+  is stored on the draft (`messages.channel`, new column) at draft time and
+  used by `send()` unless explicitly overridden. Verified against the real
+  seed data: `Q-1007` drafts on `email` because that customer's most recent
+  event is a `customer_replied` with `channel: "email"`.
+- **Every approval now records who approved it** (`messages.approved_by`,
+  new column, required by `service.approve()` and enforced by the same
+  CHECK constraint pattern as `approved_at`). The CLI defaults it to the
+  current OS user (`getpass.getuser()`) so a single-owner setup needs no
+  extra flags, with `--by` to override for a shared/multi-user setup.
+- **Reduced (not eliminated) the SQLite concurrency gap.** `db.connect()`
+  now requests WAL journal mode, which is the actually meaningful change:
+  unlike the default rollback-journal mode, a writer never blocks a reader
+  under WAL, so `candidates`/`drafts`/`outbox` can run while a `draft`/
+  `send` is in progress. I also added an explicit `PRAGMA busy_timeout =
+  5000`, but want to be honest that this one doesn't change behavior --
+  Python's `sqlite3` module already defaults new connections to a 5s busy
+  timeout, confirmed by checking `PRAGMA busy_timeout` on a connection
+  that never set it. I kept the line anyway, as explicit, change-controlled
+  documentation of a value the code depends on, not as a fix for a bug that
+  turned out not to exist. Verified the retry-not-immediate-failure
+  behavior directly: with one connection holding an open write transaction,
+  a second connection's write blocks and then succeeds once the first
+  commits, rather than raising "database is locked" right away. None of
+  this replaces a real multi-writer datastore at the 50-shop scale
+  discussed below -- it's a mitigation appropriate for a single local
+  SQLite file.
 
 ## Scaling to a parent company with 50 shops
 

@@ -52,16 +52,24 @@ CREATE TABLE IF NOT EXISTS messages (
     reason_code TEXT NOT NULL,
     reason TEXT NOT NULL,
     body TEXT NOT NULL,
+    -- The channel this draft was written for, chosen in policy.py from the
+    -- customer's own event history (which channel they've replied on /
+    -- been messaged on before) rather than hardcoded -- see
+    -- policy.preferred_channel(). send() uses this unless the caller
+    -- explicitly overrides it.
+    channel TEXT NOT NULL DEFAULT 'sms' CHECK (channel IN ('sms', 'email')),
     status TEXT NOT NULL CHECK (status IN ('draft', 'approved', 'sent', 'failed')),
     created_at TEXT NOT NULL,
     approved_at TEXT,
+    approved_by TEXT,
     sent_at TEXT,
     -- A message can't reach approved/sent/failed without having been
     -- approved first (failed only happens to a previously-approved send
     -- attempt -- see service.send()), and can't be 'sent' without a
     -- sent_at. These make a half-populated audit trail impossible rather
-    -- than just "shouldn't happen".
-    CHECK (status = 'draft' OR approved_at IS NOT NULL),
+    -- than just "shouldn't happen". approved_by is required alongside
+    -- approved_at so there's always a record of *who* approved a send.
+    CHECK (status = 'draft' OR (approved_at IS NOT NULL AND approved_by IS NOT NULL)),
     CHECK (status != 'sent' OR sent_at IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_quote ON messages(quote_id);
@@ -125,5 +133,15 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL is the real improvement here: unlike the default rollback-journal
+    # mode, a writer never blocks a reader (candidates/drafts/outbox can run
+    # while a draft/send is in progress). busy_timeout is set explicitly for
+    # documentation/stability rather than to fix a bug -- Python's sqlite3
+    # module already defaults new connections to a 5s busy timeout, so this
+    # line mostly guards against that default silently changing underneath
+    # us. Neither is a substitute for a real multi-writer datastore at the
+    # 50-shop scale discussed in the README.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.executescript(SCHEMA)
     return conn

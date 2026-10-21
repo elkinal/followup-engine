@@ -51,16 +51,38 @@ TIER_STALE_BIG = 40
 TIER_STALE_GENERAL = 10
 
 
+DEFAULT_CHANNEL = "sms"
+KNOWN_CHANNELS = {"sms", "email"}  # matches messages.channel's CHECK constraint in db.py
+
+
 @dataclass
 class QuoteSignals:
     last_viewed_at: datetime | None = None
     last_replied_at: datetime | None = None
+    last_replied_channel: str | None = None
     last_outbound_at: datetime | None = None  # message_sent, this quote only
+    last_outbound_channel: str | None = None
 
     @property
     def last_contact_at(self) -> datetime | None:
         candidates = [t for t in (self.last_replied_at, self.last_outbound_at) if t is not None]
         return max(candidates) if candidates else None
+
+    @property
+    def preferred_channel(self) -> str:
+        """Best guess at which channel actually reaches this customer, from
+        their own event history. A reply is the strongest signal -- they
+        chose that channel themselves -- so it wins even if it's older than
+        our last outbound attempt on a different channel; otherwise we go
+        with whichever channel we last messaged them on. Falls back to
+        DEFAULT_CHANNEL when there's no history at all (a brand-new quote
+        we haven't contacted yet) or the recorded channel isn't one we
+        actually know how to send on (unexpected event data)."""
+        if self.last_replied_channel in KNOWN_CHANNELS:
+            return self.last_replied_channel
+        if self.last_outbound_channel in KNOWN_CHANNELS:
+            return self.last_outbound_channel
+        return DEFAULT_CHANNEL
 
 
 @dataclass
@@ -73,6 +95,7 @@ class Candidate:
     tier: int
     reason_code: str
     reason: str
+    channel: str
     sort_key: tuple  # secondary ordering within a tier, descending
 
 
@@ -88,7 +111,7 @@ def compute_signals(conn: sqlite3.Connection, now: datetime) -> dict[str, QuoteS
 def _compute_quote_signals(conn: sqlite3.Connection, now: datetime) -> dict[str, QuoteSignals]:
     signals: dict[str, QuoteSignals] = {}
     rows = conn.execute(
-        "SELECT quote_id, type, timestamp FROM events WHERE timestamp <= ? ORDER BY timestamp ASC, event_id ASC",
+        "SELECT quote_id, type, timestamp, channel FROM events WHERE timestamp <= ? ORDER BY timestamp ASC, event_id ASC",
         (now.strftime("%Y-%m-%dT%H:%M:%SZ"),),
     ).fetchall()
     for row in rows:
@@ -101,9 +124,11 @@ def _compute_quote_signals(conn: sqlite3.Connection, now: datetime) -> dict[str,
         elif row["type"] == "customer_replied":
             if sig.last_replied_at is None or ts > sig.last_replied_at:
                 sig.last_replied_at = ts
+                sig.last_replied_channel = row["channel"]
         elif row["type"] == "message_sent":
             if sig.last_outbound_at is None or ts > sig.last_outbound_at:
                 sig.last_outbound_at = ts
+                sig.last_outbound_channel = row["channel"]
     return signals
 
 
@@ -111,7 +136,7 @@ def _apply_our_sent_messages(conn: sqlite3.Connection, signals: dict[str, QuoteS
     """Fold in messages this engine has actually sent, so a follow-up we just
     sent immediately counts as contact (don't re-flag it next run)."""
     rows = conn.execute(
-        "SELECT quote_id, sent_at FROM messages WHERE status = 'sent' AND sent_at <= ?",
+        "SELECT quote_id, sent_at, channel FROM messages WHERE status = 'sent' AND sent_at <= ?",
         (now.strftime("%Y-%m-%dT%H:%M:%SZ"),),
     ).fetchall()
     for row in rows:
@@ -120,6 +145,7 @@ def _apply_our_sent_messages(conn: sqlite3.Connection, signals: dict[str, QuoteS
         ts = parse_ts(row["sent_at"])
         if sig.last_outbound_at is None or ts > sig.last_outbound_at:
             sig.last_outbound_at = ts
+            sig.last_outbound_channel = row["channel"]
 
 
 def last_outbound_by_phone(conn: sqlite3.Connection, now: datetime) -> dict[str, datetime]:
@@ -168,6 +194,7 @@ def evaluate_quote(
                     customer_phone=quote["customer_phone"], tech_name=quote["tech_name"],
                     amount=amount, tier=TIER_REPLY_PENDING, reason_code="reply_pending",
                     reason=f"Customer replied {_fmt_delta(waited)} ago and hasn't heard back.",
+                    channel=sig.preferred_channel,
                     sort_key=(-waited,),  # longer unanswered sorts first
                 )
 
@@ -183,6 +210,7 @@ def evaluate_quote(
                     customer_phone=quote["customer_phone"], tech_name=quote["tech_name"],
                     amount=amount, tier=TIER_VIEWED_NO_RESPONSE, reason_code="viewed_no_response",
                     reason=f"Viewed {_fmt_delta(since_view)} ago, no reply yet — good moment to nudge.",
+                    channel=sig.preferred_channel,
                     sort_key=(since_view,),  # more recent view sorts first
                 )
 
@@ -196,6 +224,7 @@ def evaluate_quote(
             customer_phone=quote["customer_phone"], tech_name=quote["tech_name"],
             amount=amount, tier=TIER_STALE_BIG, reason_code="stale_big",
             reason=f"${amount:,} quote with no contact in {stale_for.days}d.",
+            channel=sig.preferred_channel,
             sort_key=(-amount, -stale_for),  # bigger, staler quotes sort first
         )
     if stale_for >= STALE_DAYS_GENERAL:
@@ -204,6 +233,7 @@ def evaluate_quote(
             customer_phone=quote["customer_phone"], tech_name=quote["tech_name"],
             amount=amount, tier=TIER_STALE_GENERAL, reason_code="stale_general",
             reason=f"No contact in {stale_for.days}d.",
+            channel=sig.preferred_channel,
             sort_key=(-stale_for,),  # staler quotes sort first
         )
 

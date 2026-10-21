@@ -52,10 +52,10 @@ def create_drafts(conn: sqlite3.Connection, now: datetime) -> DraftResult:
                 """
                 INSERT INTO messages
                     (id, quote_id, customer_phone, reason_code, reason, body,
-                     status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'draft', ?)
+                     channel, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?)
                 """,
-                (message_id, c.quote_id, c.customer_phone, c.reason_code, c.reason, body, now_str),
+                (message_id, c.quote_id, c.customer_phone, c.reason_code, c.reason, body, c.channel, now_str),
             )
         except sqlite3.IntegrityError as e:
             # Two cases land here: another draft/approved message is already
@@ -78,7 +78,9 @@ def create_drafts(conn: sqlite3.Connection, now: datetime) -> DraftResult:
     return result
 
 
-def approve(conn: sqlite3.Connection, message_id: str, now: datetime) -> None:
+def approve(conn: sqlite3.Connection, message_id: str, now: datetime, approved_by: str) -> None:
+    if not approved_by or not approved_by.strip():
+        raise ValueError("approved_by is required -- who is approving this message?")
     row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
     if row is None:
         raise ValueError(f"no such message: {message_id}")
@@ -88,8 +90,8 @@ def approve(conn: sqlite3.Connection, message_id: str, now: datetime) -> None:
         )
     try:
         conn.execute(
-            "UPDATE messages SET status = 'approved', approved_at = ? WHERE id = ?",
-            (format_ts(now), message_id),
+            "UPDATE messages SET status = 'approved', approved_at = ?, approved_by = ? WHERE id = ?",
+            (format_ts(now), approved_by, message_id),
         )
     except sqlite3.IntegrityError:
         # block_approve_for_non_open_quote trigger: the quote closed between
@@ -107,11 +109,16 @@ class SendResult:
     already_sent: bool
 
 
-def send(conn: sqlite3.Connection, message_id: str, now: datetime, channel: str = "sms") -> SendResult:
+def send(conn: sqlite3.Connection, message_id: str, now: datetime, channel: str | None = None) -> SendResult:
     """Send an approved message. Idempotent: calling this again for a
     message that's already sent (e.g. a retried request after the network
     call to the real provider timed out, or re-running the whole engine) is
     a safe no-op -- it will never write a second outbox row or re-send.
+
+    `channel` defaults to None, meaning "use the channel this draft was
+    written for" (chosen in policy.py from the customer's own history --
+    see QuoteSignals.preferred_channel). Pass an explicit channel only to
+    override that choice for this particular send.
     """
     row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
     if row is None:
@@ -136,6 +143,7 @@ def send(conn: sqlite3.Connection, message_id: str, now: datetime, channel: str 
         )
 
     now_str = format_ts(now)
+    send_channel = channel if channel is not None else row["channel"]
     # INSERT OR IGNORE on a PRIMARY KEY is the idempotency boundary: this is
     # the one write that represents "a message actually went out", keyed by
     # message_id so a retry of this exact call can never produce a second
@@ -145,7 +153,7 @@ def send(conn: sqlite3.Connection, message_id: str, now: datetime, channel: str 
         INSERT OR IGNORE INTO outbox (message_id, quote_id, customer_phone, channel, body, sent_at)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (message_id, row["quote_id"], row["customer_phone"], channel, row["body"], now_str),
+        (message_id, row["quote_id"], row["customer_phone"], send_channel, row["body"], now_str),
     )
     conn.execute(
         "UPDATE messages SET status = 'sent', sent_at = COALESCE(sent_at, ?) WHERE id = ? AND status != 'sent'",

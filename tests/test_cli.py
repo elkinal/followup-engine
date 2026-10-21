@@ -61,7 +61,7 @@ class TestCliHappyPath(unittest.TestCase):
         self.quotes_path = self.tmp / "quotes.json"
         self.events_path = self.tmp / "events.jsonl"
         self.quotes_path.write_text(json.dumps([{
-            "id": "Q-1", "customer_name": "Ann", "customer_phone": "+1",
+            "id": "Q-1", "customer_name": "Ann", "customer_phone": "+19175551234",
             "tech_name": "Brad", "amount": 10000, "status": "open",
             "created_at": "2026-07-01T00:00:00Z", "last_contact_at": None,
         }]))

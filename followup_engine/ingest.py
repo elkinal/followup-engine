@@ -15,6 +15,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .phone import normalize_phone
 from .timeutil import format_ts, parse_ts
 
 
@@ -48,34 +49,52 @@ VALID_STATUSES = {"open", "accepted", "dismissed"}
 REQUIRED_EVENT_FIELDS = {"event_id", "type", "quote_id", "timestamp"}
 
 
-def _valid_quote_row(row: object) -> bool:
-    """Check both field *presence* and that values are actually usable --
-    a key existing with a null/empty/wrong-typed value would otherwise slip
-    past a plain issubset() check and only fail later, deep in a NOT NULL
+def _normalize_quote_row(row: object) -> dict | None:
+    """Validate a raw quote record and return a cleaned dict ready to bind
+    into the INSERT, or None if the row isn't usable. Combines validation
+    and normalization in one pass: a key existing with a null/empty/
+    wrong-typed/wrong-shaped value would otherwise slip past a plain
+    issubset() presence check and only fail later, deep in a NOT NULL
     constraint or a crash in policy.py."""
     if not isinstance(row, dict) or not REQUIRED_QUOTE_FIELDS.issubset(row):
-        return False
+        return None
     if row["status"] not in VALID_STATUSES:
-        return False
+        return None
     if not isinstance(row["id"], str) or not row["id"]:
-        return False
+        return None
     if not isinstance(row["customer_name"], str) or not row["customer_name"].strip():
-        return False
-    if not isinstance(row["customer_phone"], str) or not row["customer_phone"]:
-        return False
+        return None
     if not isinstance(row["amount"], (int, float)) or isinstance(row["amount"], bool) or row["amount"] < 0:
-        return False
+        return None
+
+    # Normalize to the canonical E.164-ish phone form so the same customer
+    # texted/entered in two different formats (e.g. "+19175552003" vs
+    # "(917) 555-2003") resolves to one identity -- the cross-quote cooldown
+    # guardrail keys on this field, so an un-normalized phone number would
+    # silently let it be bypassed.
+    phone = normalize_phone(row["customer_phone"])
+    if phone is None:
+        return None
+
+    # Normalize to the canonical Z-suffixed UTC form before storing. Every
+    # timestamp comparison/ordering in policy.py is a SQL string comparison
+    # (`WHERE timestamp <= ?`, `ORDER BY timestamp`), which only agrees with
+    # chronological order if every stored row uses the exact same format --
+    # a validly-parseable but differently-shaped timestamp (e.g. a "+08:00"
+    # offset instead of "Z") would otherwise sort incorrectly and silently
+    # corrupt signal computation.
     try:
-        parse_ts(row["created_at"])
+        created_at = format_ts(parse_ts(row["created_at"]))
     except (TypeError, ValueError):
-        return False
+        return None
     last_contact = row.get("last_contact_at")
     if last_contact is not None:
         try:
-            parse_ts(last_contact)
+            last_contact = format_ts(parse_ts(last_contact))
         except (TypeError, ValueError):
-            return False
-    return True
+            return None
+
+    return {**row, "customer_phone": phone, "created_at": created_at, "last_contact_at": last_contact}
 
 
 def _load_json_list(path: str | Path, what: str) -> list:
@@ -98,22 +117,10 @@ def ingest_quotes(conn: sqlite3.Connection, path: str | Path) -> IngestReport:
     report = IngestReport()
     data = _load_json_list(path, "quotes")
     for row in data:
-        if not _valid_quote_row(row):
+        params = _normalize_quote_row(row)
+        if params is None:
             report.quotes_skipped += 1
             continue
-        # Normalize to the canonical Z-suffixed UTC form before storing.
-        # Every timestamp comparison/ordering in policy.py is a SQL string
-        # comparison (`WHERE timestamp <= ?`, `ORDER BY timestamp`), which
-        # only agrees with chronological order if every stored row uses the
-        # exact same format -- a validly-parseable but differently-shaped
-        # timestamp (e.g. a "+08:00" offset instead of "Z") would otherwise
-        # sort incorrectly and silently corrupt signal computation.
-        last_contact = row.get("last_contact_at")
-        params = {
-            **row,
-            "created_at": format_ts(parse_ts(row["created_at"])),
-            "last_contact_at": format_ts(parse_ts(last_contact)) if last_contact is not None else None,
-        }
         try:
             conn.execute(
                 """
@@ -133,10 +140,10 @@ def ingest_quotes(conn: sqlite3.Connection, path: str | Path) -> IngestReport:
                 params,
             )
         except sqlite3.IntegrityError:
-            # Belt and suspenders: _valid_quote_row() should have already
-            # caught anything that would fail a schema constraint, but one
-            # bad row must never abort the rows around it or lose whatever
-            # was already staged in this transaction.
+            # Belt and suspenders: _normalize_quote_row() should have
+            # already caught anything that would fail a schema constraint,
+            # but one bad row must never abort the rows around it or lose
+            # whatever was already staged in this transaction.
             report.quotes_skipped += 1
             continue
         report.quotes_upserted += 1

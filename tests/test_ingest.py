@@ -8,7 +8,7 @@ from tests.helpers import make_db
 
 
 QUOTE = {
-    "id": "Q-1", "customer_name": "Ann", "customer_phone": "+1555",
+    "id": "Q-1", "customer_name": "Ann", "customer_phone": "+19175551234",
     "tech_name": "Brad", "amount": 1000, "status": "open",
     "created_at": "2026-08-01T00:00:00Z", "last_contact_at": None,
 }
@@ -112,6 +112,27 @@ class TestIngest(unittest.TestCase):
         self.events_path.write_text("")
         with self.assertRaises(ingest.IngestError):
             ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+
+    def test_differently_formatted_phone_numbers_for_the_same_customer_are_normalized_to_match(self):
+        # Same real person, two different string spellings -- the guardrail
+        # that keys on customer_phone (cross-quote cooldown) only works if
+        # these resolve to the same stored value.
+        q1 = {**QUOTE, "id": "Q-1", "customer_phone": "+19175552003"}
+        q2 = {**QUOTE, "id": "Q-2", "customer_phone": "(917) 555-2003"}
+        self._write([q1, q2], [])
+        ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        phones = {
+            row["id"]: row["customer_phone"]
+            for row in self.conn.execute("SELECT id, customer_phone FROM quotes")
+        }
+        self.assertEqual(phones["Q-1"], phones["Q-2"])
+
+    def test_unparseable_phone_number_is_skipped_not_fatal(self):
+        bad = {**QUOTE, "customer_phone": "abc"}
+        self._write([bad], [])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.quotes_skipped, 1)
+        self.assertEqual(report.quotes_upserted, 0)
 
 
 if __name__ == "__main__":

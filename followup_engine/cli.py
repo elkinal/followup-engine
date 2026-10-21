@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -71,15 +72,20 @@ def cmd_drafts(args):
         print("No messages.")
         return
     for row in rows:
+        approver = f" approved_by={row['approved_by']}" if row["approved_by"] else ""
         print(f"[{row['status']:<9}] {row['id']}  {row['quote_id']}  "
-              f"{row['customer_phone']}  ({row['reason_code']}): {row['body']}")
+              f"{row['customer_phone']}  [{row['channel']}]  ({row['reason_code']}): {row['body']}{approver}")
 
 
 def cmd_approve(args):
     conn = _connect(args)
     now = _now(args)
-    service.approve(conn, args.message_id, now)
-    print(f"Approved {args.message_id}.")
+    # Default to the OS user running the command -- a reasonable zero-config
+    # identity for a local single-owner tool, overridable with --by for a
+    # shared/multi-user setup.
+    approved_by = args.by or getpass.getuser()
+    service.approve(conn, args.message_id, now, approved_by=approved_by)
+    print(f"Approved {args.message_id} (by {approved_by}).")
 
 
 def cmd_send(args):
@@ -128,12 +134,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("approve", help="approve a draft message")
     p.add_argument("message_id")
     p.add_argument("--now", help="ISO-8601 timestamp (default: real current time)")
+    p.add_argument("--by", help="identity of the approver (default: current OS user)")
     p.set_defaults(func=cmd_approve)
 
     p = sub.add_parser("send", help="send an approved message (idempotent)")
     p.add_argument("message_id")
     p.add_argument("--now", help="ISO-8601 timestamp (default: real current time)")
-    p.add_argument("--channel", default="sms")
+    p.add_argument("--channel", default=None,
+                    help="override the channel the draft was written for (default: use the draft's own channel)")
     p.set_defaults(func=cmd_send)
 
     p = sub.add_parser("outbox", help="show everything that has actually been sent")
@@ -151,7 +159,11 @@ def main(argv=None):
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
     except sqlite3.OperationalError as e:
-        print(f"error: could not open database {args.db!r}: {e}", file=sys.stderr)
+        if "locked" in str(e) or "busy" in str(e):
+            print(f"error: database {args.db!r} is busy (another process is writing to it) -- try again: {e}",
+                  file=sys.stderr)
+        else:
+            print(f"error: could not open database {args.db!r}: {e}", file=sys.stderr)
         sys.exit(1)
 
 

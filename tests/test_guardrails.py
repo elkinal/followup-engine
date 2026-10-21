@@ -78,7 +78,7 @@ class TestApproveSendGuardrails(unittest.TestCase):
             service.send(self.conn, self.message_id, NOW)
 
     def test_send_is_idempotent_under_retry(self):
-        service.approve(self.conn, self.message_id, NOW)
+        service.approve(self.conn, self.message_id, NOW, approved_by="brad@example.com")
         r1 = service.send(self.conn, self.message_id, NOW)
         r2 = service.send(self.conn, self.message_id, NOW)
         self.assertFalse(r1.already_sent)
@@ -89,7 +89,7 @@ class TestApproveSendGuardrails(unittest.TestCase):
         self.assertEqual(count, 1)
 
     def test_send_refuses_a_quote_that_became_accepted_after_approval(self):
-        service.approve(self.conn, self.message_id, NOW)
+        service.approve(self.conn, self.message_id, NOW, approved_by="brad@example.com")
         self.conn.execute("UPDATE quotes SET status = 'accepted' WHERE id = 'Q-A'")
         self.conn.commit()
         with self.assertRaises(service.GuardrailViolation):
@@ -98,10 +98,40 @@ class TestApproveSendGuardrails(unittest.TestCase):
         self.assertEqual(count, 0)
 
     def test_cannot_approve_an_already_sent_message_again(self):
-        service.approve(self.conn, self.message_id, NOW)
+        service.approve(self.conn, self.message_id, NOW, approved_by="brad@example.com")
         service.send(self.conn, self.message_id, NOW)
         with self.assertRaises(service.GuardrailViolation):
-            service.approve(self.conn, self.message_id, NOW)
+            service.approve(self.conn, self.message_id, NOW, approved_by="brad@example.com")
+
+    def test_approve_requires_an_approver_identity(self):
+        with self.assertRaises(ValueError):
+            service.approve(self.conn, self.message_id, NOW, approved_by="")
+        with self.assertRaises(ValueError):
+            service.approve(self.conn, self.message_id, NOW, approved_by="   ")
+
+    def test_approver_identity_is_recorded(self):
+        service.approve(self.conn, self.message_id, NOW, approved_by="brad@example.com")
+        row = self.conn.execute("SELECT approved_by FROM messages WHERE id = ?", (self.message_id,)).fetchone()
+        self.assertEqual(row["approved_by"], "brad@example.com")
+
+    def test_send_defaults_to_the_channel_the_draft_was_written_for(self):
+        stored_channel = self.conn.execute(
+            "SELECT channel FROM messages WHERE id = ?", (self.message_id,)
+        ).fetchone()["channel"]
+        service.approve(self.conn, self.message_id, NOW, approved_by="brad@example.com")
+        service.send(self.conn, self.message_id, NOW)  # no channel override
+        outbox_channel = self.conn.execute(
+            "SELECT channel FROM outbox WHERE message_id = ?", (self.message_id,)
+        ).fetchone()["channel"]
+        self.assertEqual(outbox_channel, stored_channel)
+
+    def test_send_channel_can_be_explicitly_overridden(self):
+        service.approve(self.conn, self.message_id, NOW, approved_by="brad@example.com")
+        service.send(self.conn, self.message_id, NOW, channel="email")
+        outbox_channel = self.conn.execute(
+            "SELECT channel FROM outbox WHERE message_id = ?", (self.message_id,)
+        ).fetchone()["channel"]
+        self.assertEqual(outbox_channel, "email")
 
 
 if __name__ == "__main__":

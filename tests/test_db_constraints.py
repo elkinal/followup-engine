@@ -41,21 +41,23 @@ class TestNonOpenQuoteGuardrails(unittest.TestCase):
         self.conn.execute("UPDATE quotes SET status = 'accepted' WHERE id = 'Q-1'")
         with self.assertRaises(sqlite3.IntegrityError):
             self.conn.execute(
-                "UPDATE messages SET status='approved', approved_at='2026-08-16T01:00:00Z' WHERE id='m1'"
+                "UPDATE messages SET status='approved', approved_at='2026-08-16T01:00:00Z', "
+                "approved_by='brad' WHERE id='m1'"
             )
 
     def test_can_still_approve_while_quote_remains_open(self):
         insert_quote(self.conn, "Q-1", status="open")
         insert_message(self.conn, status="draft")
         self.conn.execute(
-            "UPDATE messages SET status='approved', approved_at='2026-08-16T01:00:00Z' WHERE id='m1'"
+            "UPDATE messages SET status='approved', approved_at='2026-08-16T01:00:00Z', "
+            "approved_by='brad' WHERE id='m1'"
         )  # must not raise
         status = self.conn.execute("SELECT status FROM messages WHERE id='m1'").fetchone()["status"]
         self.assertEqual(status, "approved")
 
     def test_cannot_write_outbox_row_for_a_non_open_quote(self):
         insert_quote(self.conn, "Q-1", status="open")
-        insert_message(self.conn, status="approved", approved_at="2026-08-16T01:00:00Z")
+        insert_message(self.conn, status="approved", approved_at="2026-08-16T01:00:00Z", approved_by="brad")
         self.conn.execute("UPDATE quotes SET status = 'dismissed' WHERE id = 'Q-1'")
         with self.assertRaises(sqlite3.IntegrityError):
             self.conn.execute(
@@ -89,12 +91,23 @@ class TestFieldLevelConstraints(unittest.TestCase):
     def test_sent_message_without_sent_at_is_rejected(self):
         insert_quote(self.conn, "Q-1", status="open")
         with self.assertRaises(sqlite3.IntegrityError):
-            insert_message(self.conn, status="sent", approved_at="2026-08-16T00:00:00Z", sent_at=None)
+            insert_message(self.conn, status="sent", approved_at="2026-08-16T00:00:00Z",
+                            approved_by="brad", sent_at=None)
 
     def test_non_draft_message_without_approved_at_is_rejected(self):
         insert_quote(self.conn, "Q-1", status="open")
         with self.assertRaises(sqlite3.IntegrityError):
-            insert_message(self.conn, status="approved", approved_at=None)
+            insert_message(self.conn, status="approved", approved_at=None, approved_by="brad")
+
+    def test_non_draft_message_without_approved_by_is_rejected(self):
+        insert_quote(self.conn, "Q-1", status="open")
+        with self.assertRaises(sqlite3.IntegrityError):
+            insert_message(self.conn, status="approved", approved_at="2026-08-16T00:00:00Z", approved_by=None)
+
+    def test_message_channel_must_be_a_known_channel(self):
+        insert_quote(self.conn, "Q-1", status="open")
+        with self.assertRaises(sqlite3.IntegrityError):
+            insert_message(self.conn, channel="carrier_pigeon")
 
 
 if __name__ == "__main__":

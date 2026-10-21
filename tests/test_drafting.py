@@ -8,7 +8,7 @@ def make_candidate(**overrides):
     row = dict(
         quote_id="Q-1", customer_name="Ann Smith", customer_phone="+1",
         tech_name="Brad", amount=1000, tier=10, reason_code="stale_general",
-        reason="r", sort_key=(),
+        reason="r", channel="sms", sort_key=(),
     )
     row.update(overrides)
     return Candidate(**row)

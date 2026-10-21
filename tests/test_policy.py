@@ -119,5 +119,40 @@ class TestPolicyRules(unittest.TestCase):
         self.assertNotIn("Q-JUST-UNDER", codes)
 
 
+def channels(conn, now=NOW):
+    return {c.quote_id: c.channel for c in policy.get_candidates(conn, now)}
+
+
+class TestPreferredChannel(unittest.TestCase):
+    def setUp(self):
+        self.conn = make_db(self)
+
+    def test_defaults_to_sms_with_no_history(self):
+        insert_quote(self.conn, "Q-1", amount=10000, created_at="2026-08-01T00:00:00Z")
+        self.assertEqual(channels(self.conn)["Q-1"], "sms")
+
+    def test_uses_the_channel_the_customer_last_replied_on(self):
+        insert_quote(self.conn, "Q-1", amount=10000, created_at="2026-07-01T00:00:00Z")
+        insert_event(self.conn, "e1", "message_sent", "Q-1", "2026-07-02T00:00:00Z", channel="sms")
+        insert_event(self.conn, "e2", "customer_replied", "Q-1", "2026-08-15T00:00:00Z", channel="email")
+        self.assertEqual(channels(self.conn)["Q-1"], "email")
+
+    def test_reply_channel_wins_even_if_it_is_older_than_a_later_outbound_send(self):
+        insert_quote(self.conn, "Q-1", amount=10000, created_at="2026-07-01T00:00:00Z")
+        insert_event(self.conn, "e1", "customer_replied", "Q-1", "2026-07-05T00:00:00Z", channel="email")
+        insert_event(self.conn, "e2", "message_sent", "Q-1", "2026-07-10T00:00:00Z", channel="sms")
+        self.assertEqual(channels(self.conn)["Q-1"], "email")
+
+    def test_falls_back_to_last_outbound_channel_when_no_reply_exists(self):
+        insert_quote(self.conn, "Q-1", amount=10000, created_at="2026-07-01T00:00:00Z")
+        insert_event(self.conn, "e1", "message_sent", "Q-1", "2026-07-02T00:00:00Z", channel="email")
+        self.assertEqual(channels(self.conn)["Q-1"], "email")
+
+    def test_unrecognized_channel_value_falls_back_to_default(self):
+        insert_quote(self.conn, "Q-1", amount=10000, created_at="2026-07-01T00:00:00Z")
+        insert_event(self.conn, "e1", "message_sent", "Q-1", "2026-07-02T00:00:00Z", channel="carrier_pigeon")
+        self.assertEqual(channels(self.conn)["Q-1"], "sms")
+
+
 if __name__ == "__main__":
     unittest.main()
