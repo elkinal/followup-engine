@@ -116,8 +116,27 @@ Guardrails (enforced in `service.py`, the only module that writes to
 - **Cooldown, by customer phone number, not by quote** -- the seed data has
   two separate open quotes for the same customer (`Q-1003`/`Q-1025`, Karen
   Nguyen, same phone). The guardrail's intent is "don't spam this human,"
-  so a message to one of her quotes puts both on cooldown (48h) for the rest
-  of the batch, even though they're different `quote_id`s.
+  so a message to one of her quotes puts both on cooldown (48h), even though
+  they're different `quote_id`s. This used to only hold *within one
+  `create_drafts()` call* -- found by literally running the CLI against the
+  full seed data twice, five minutes apart: the first run drafted a message
+  for one of Karen's quotes and correctly skipped the other for cooldown,
+  but the second run (simulating a re-run before the first batch was
+  approved) drafted the *other* quote too, because cooldown was computed
+  from actual sends plus same-batch drafts only -- never from a different
+  run's still-open draft. Approving and sending both then produced two real
+  outbound messages to the same customer a minute apart, which I confirmed
+  by actually doing it end-to-end through the CLI before fixing it. Two
+  fixes, mirroring how the accepted/dismissed guardrail already has both a
+  draft-time check and a send-time re-check: `create_drafts()` now also
+  treats any existing open (unsent) draft/approved message as provisional
+  contact, so the conflicting draft is never created; and `send()`
+  independently re-checks cooldown immediately before writing to the
+  outbox, since it's the function with the actual side effect and can't
+  assume draft-time prevention ever ran (tested directly by inserting two
+  open messages for the same phone and proving `send()` refuses the second,
+  bypassing `create_drafts()`'s own prevention entirely in
+  `TestCooldownIsAuthoritativeAtSendTime`).
 - **No double-send on retry/re-run** -- `send()` is keyed by `message_id`
   and writes to the `outbox` table via `INSERT OR IGNORE` on its primary
   key, so retrying an identical send call (crash, timeout, re-running the
@@ -259,6 +278,37 @@ were "found but not fixed" above:
   this replaces a real multi-writer datastore at the 50-shop scale
   discussed below -- it's a mitigation appropriate for a single local
   SQLite file.
+
+### A final correctness-and-coverage verification pass
+
+I went back and actually measured branch coverage with `coverage.py`
+(installed in a throwaway venv -- not a project dependency) rather than
+estimating it, then closed the gaps that were real risk, not just missing
+percentage: 81% -> 95% overall branch coverage, adding tests for the CLI's
+`candidates`/`drafts` commands (previously never invoked by any test despite
+being 2 of the 7 commands), several `ingest.py` validation branches that
+were exercised manually at some point in this process but never promoted to
+a permanent test (notably the exact `parse_ts(None)` bug from the second
+pass), and the `approve()`-time trigger conversion. Two small real fixes
+came out of that: a dead function (`timeutil.utcnow_str`, defined, never
+called) was deleted instead of tested, and `tech_name`/`id` were missing the
+same value-validation every other required quote field already had
+(`id` didn't `.strip()` the way `customer_name`/`tech_name` did, so a
+whitespace-only id would have been silently accepted).
+
+The actual catch, though, came from exhaustively re-running the full CLI
+against the real seed data rather than trusting the existing test suite:
+running `draft` twice, five minutes apart, produced two open drafts for
+Karen Nguyen (`Q-1003`/`Q-1025`) instead of one -- documented in detail
+above under "Cooldown, by customer phone number." That's a real,
+confirmed-exploitable violation of one of the three guardrails the
+assignment names explicitly, and it existed because the test suite had
+never exercised "call `create_drafts()` twice, separately, before either
+batch is approved" -- every cooldown test up to that point called it once,
+or twice back-to-back in the same test (which only proves the single-batch
+case). It's now fixed at both the draft-creation and send-time layers, with
+tests that specifically bypass `create_drafts()`'s own prevention to prove
+`send()` holds the line independently. 116 tests total.
 
 ## Scaling to a parent company with 50 shops
 

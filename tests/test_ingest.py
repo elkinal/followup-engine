@@ -150,6 +150,125 @@ class TestIngest(unittest.TestCase):
         self.assertEqual(report.quotes_skipped, 1)
         self.assertEqual(report.quotes_upserted, 0)
 
+    def test_quote_with_blank_id_is_skipped(self):
+        bad = {**QUOTE, "id": "   "}
+        self._write([bad], [])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.quotes_skipped, 1)
+
+    def test_quote_with_blank_customer_name_is_skipped(self):
+        bad = {**QUOTE, "customer_name": "   "}
+        self._write([bad], [])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.quotes_skipped, 1)
+
+    def test_quote_with_negative_amount_is_skipped_through_the_real_pipeline(self):
+        bad = {**QUOTE, "amount": -100}
+        self._write([bad], [])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.quotes_skipped, 1)
+
+    def test_quote_with_boolean_amount_is_skipped(self):
+        # JSON true/false parse to Python bool, which is a subclass of int --
+        # would silently pass an isinstance(x, (int, float)) check and get
+        # stored as a nonsense amount unless explicitly excluded.
+        bad = {**QUOTE, "amount": True}
+        self._write([bad], [])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.quotes_skipped, 1)
+
+    def test_quote_with_non_numeric_amount_is_skipped(self):
+        bad = {**QUOTE, "amount": "a lot"}
+        self._write([bad], [])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.quotes_skipped, 1)
+
+    def test_event_with_null_timestamp_is_skipped_not_fatal(self):
+        # Regression test for a real bug: parse_ts(None) used to raise
+        # AttributeError (not TypeError/ValueError), which slipped past this
+        # exact except clause and crashed the whole ingest. Confirmed fixed
+        # manually earlier; this locks it in permanently.
+        bad = json.dumps({"event_id": "e1", "type": "quote_viewed", "quote_id": "Q-1", "timestamp": None})
+        self._write([QUOTE], [bad])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.events_inserted, 0)
+        self.assertEqual(len(report.events_skipped), 1)
+        self.assertIn("unparseable timestamp", report.events_skipped[0])
+
+    def test_event_with_garbage_timestamp_string_is_skipped_not_fatal(self):
+        bad = json.dumps({"event_id": "e1", "type": "quote_viewed", "quote_id": "Q-1", "timestamp": "not-a-date"})
+        self._write([QUOTE], [bad])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(len(report.events_skipped), 1)
+
+    def test_missing_events_file_raises_ingest_error_not_a_crash(self):
+        self._write([QUOTE], [])  # quotes.json exists and is valid
+        with self.assertRaises(ingest.IngestError):
+            ingest.ingest_all(self.conn, self.quotes_path, self.tmp / "nope.jsonl")
+
+    def test_quotes_file_with_invalid_json_syntax_raises_ingest_error(self):
+        self.quotes_path.write_text("{not valid json")
+        self.events_path.write_text("")
+        with self.assertRaises(ingest.IngestError):
+            ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+
+    def test_quote_missing_a_required_field_entirely_is_skipped(self):
+        incomplete = {k: v for k, v in QUOTE.items() if k != "tech_name"}
+        self._write([incomplete], [])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.quotes_skipped, 1)
+        self.assertEqual(report.quotes_upserted, 0)
+
+    def test_quote_with_blank_tech_name_is_skipped(self):
+        bad = {**QUOTE, "tech_name": "   "}
+        self._write([bad], [])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.quotes_skipped, 1)
+
+    def test_quote_with_unknown_status_is_skipped_through_the_real_pipeline(self):
+        bad = {**QUOTE, "status": "pending"}
+        self._write([bad], [])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.quotes_skipped, 1)
+
+    def test_quote_with_garbage_created_at_is_skipped(self):
+        bad = {**QUOTE, "created_at": "not-a-date"}
+        self._write([bad], [])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.quotes_skipped, 1)
+
+    def test_quote_with_garbage_last_contact_at_is_skipped(self):
+        bad = {**QUOTE, "last_contact_at": "not-a-date"}
+        self._write([bad], [])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.quotes_skipped, 1)
+
+    def test_event_missing_a_required_field_entirely_is_skipped(self):
+        incomplete = json.dumps({"event_id": "e1", "type": "quote_viewed", "quote_id": "Q-1"})  # no timestamp
+        self._write([QUOTE], [incomplete])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(len(report.events_skipped), 1)
+
+    def test_event_with_blank_event_id_is_skipped(self):
+        bad = json.dumps({"event_id": "", "type": "quote_viewed", "quote_id": "Q-1", "timestamp": "2026-08-02T00:00:00Z"})
+        self._write([QUOTE], [bad])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(len(report.events_skipped), 1)
+
+    def test_event_with_blank_type_is_skipped(self):
+        bad = json.dumps({"event_id": "e1", "type": "", "quote_id": "Q-1", "timestamp": "2026-08-02T00:00:00Z"})
+        self._write([QUOTE], [bad])
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(len(report.events_skipped), 1)
+
+    def test_blank_lines_in_events_file_are_skipped_silently(self):
+        line = json.dumps({"event_id": "e1", "type": "quote_viewed", "quote_id": "Q-1", "timestamp": "2026-08-02T00:00:00Z"})
+        self.quotes_path.write_text(json.dumps([QUOTE]))
+        self.events_path.write_text(f"\n\n{line}\n\n")  # real blank lines, not just a trailing newline
+        report = ingest.ingest_all(self.conn, self.quotes_path, self.events_path)
+        self.assertEqual(report.events_inserted, 1)
+        self.assertEqual(report.events_skipped, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,12 @@ class TestNormalizePhone(unittest.TestCase):
     def test_empty_string_is_rejected(self):
         self.assertIsNone(normalize_phone(""))
 
+    def test_non_us_shaped_number_without_plus_falls_back_to_best_effort(self):
+        # A 12-digit international number with no leading 1 and no '+' --
+        # doesn't match either US-shaped special case, so it hits the final
+        # best-effort fallback rather than being rejected outright.
+        self.assertEqual(normalize_phone("442071234567"), "+442071234567")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,7 +11,7 @@ from datetime import datetime
 
 from . import policy
 from .drafting import draft_message
-from .timeutil import format_ts
+from .timeutil import format_ts, parse_ts
 
 
 class GuardrailViolation(Exception):
@@ -27,19 +27,50 @@ class DraftResult:
 def create_drafts(conn: sqlite3.Connection, now: datetime) -> DraftResult:
     """Turn today's top candidates into draft messages.
 
-    Safe to call repeatedly for the same (or a later) `now`: a quote that
-    already has an open draft/approved message is skipped (enforced by the
-    `uniq_open_message_per_quote` index as a backstop), and a customer who
-    was messaged within the cooldown window is skipped even if a *different*
-    one of their quotes is the one producing the candidate.
+    Safe to call repeatedly, including across separate invocations (e.g. a
+    re-run before an earlier batch was approved), not just within one call:
+    a quote that already has an open draft/approved message is skipped
+    (enforced by the `uniq_open_message_per_quote` index as a backstop), and
+    a customer who was messaged -- or who already has an open, unsent draft
+    -- within the cooldown window is skipped even if a *different* one of
+    their quotes is the one producing the candidate. send() independently
+    re-checks cooldown too, since it's the function with the actual
+    side effect and can't assume this function's prevention ran.
     """
     candidates = policy.get_candidates(conn, now)
     last_outbound = policy.last_outbound_by_phone(conn, now)
+
+    # An open (not-yet-sent) draft/approved message to a phone counts as a
+    # provisional contact too, not just an actual send: without this, two
+    # *separate* calls to create_drafts() (e.g. today's run, then a re-run
+    # tomorrow before today's drafts were approved) could each independently
+    # draft a message to the same customer for two different quotes -- and
+    # since send() only re-checks the quote's status, not cooldown, a human
+    # approving both would actually double-message the customer. Treating an
+    # open draft as "spoken for" here stops the conflicting draft from being
+    # created in the first place, rather than only catching it at send time.
+    open_quote_ids = set()
+    for row in conn.execute("SELECT quote_id, customer_phone, created_at FROM messages WHERE status IN ('draft', 'approved')"):
+        open_quote_ids.add(row["quote_id"])
+        ts = parse_ts(row["created_at"])
+        phone = row["customer_phone"]
+        if phone not in last_outbound or ts > last_outbound[phone]:
+            last_outbound[phone] = ts
 
     result = DraftResult(created=[], skipped=[])
     now_str = format_ts(now)
 
     for c in candidates:
+        # Check "this exact quote already has an open draft" before the
+        # broader phone-level cooldown check below -- both would correctly
+        # skip it, but they mean different things to a human reading the
+        # skip list ("you already have a draft for this one" vs. "a
+        # *different* quote for this customer was just contacted"), and the
+        # more specific reason is more useful.
+        if c.quote_id in open_quote_ids:
+            result.skipped.append((c.quote_id, "already has an open draft"))
+            continue
+
         last = last_outbound.get(c.customer_phone)
         if last is not None and (now - last) < policy.COOLDOWN:
             result.skipped.append((c.quote_id, "cooldown"))
@@ -58,12 +89,14 @@ def create_drafts(conn: sqlite3.Connection, now: datetime) -> DraftResult:
                 (message_id, c.quote_id, c.customer_phone, c.reason_code, c.reason, body, c.channel, now_str),
             )
         except sqlite3.IntegrityError as e:
-            # Two cases land here: another draft/approved message is already
-            # outstanding for this quote (e.g. this function ran twice for
-            # the same batch), or the `block_draft_for_non_open_quote`
-            # trigger rejected it because the quote closed between
-            # get_candidates() and this insert (a race condition backstop --
-            # policy.py already filters to open quotes, so this is rare).
+            # Both the "already has an open draft" and "quote no longer
+            # open" cases are now checked *before* this insert is attempted
+            # (open_quote_ids above, and policy.py only surfacing open
+            # quotes), so in a single-threaded run this except is dead code
+            # by design -- it's a concurrency backstop for a genuinely
+            # concurrent write landing between our checks and this insert
+            # (e.g. two CLI processes racing), not a path exercised by
+            # normal single-process use.
             reason = "quote no longer open" if "not open" in str(e) else "already has an open draft"
             result.skipped.append((c.quote_id, reason))
             continue
@@ -140,6 +173,21 @@ def send(conn: sqlite3.Connection, message_id: str, now: datetime, channel: str 
         conn.commit()
         raise GuardrailViolation(
             f"quote {row['quote_id']} is no longer open ({quote['status'] if quote else 'missing'}) -- refusing to send"
+        )
+
+    # Re-validate cooldown too: create_drafts() blocks a *new* draft to a
+    # phone that already has one outstanding, but two drafts for the same
+    # customer can still both reach 'approved' (e.g. from two separate
+    # draft-generation runs before either was sent). This is the
+    # authoritative check -- the one that actually gates the real outbound
+    # side effect -- mirroring the quote-status re-check above.
+    last_outbound = policy.last_outbound_by_phone(conn, now)
+    last_sent_to_this_phone = last_outbound.get(row["customer_phone"])
+    if last_sent_to_this_phone is not None and (now - last_sent_to_this_phone) < policy.COOLDOWN:
+        conn.execute("UPDATE messages SET status = 'failed' WHERE id = ?", (message_id,))
+        conn.commit()
+        raise GuardrailViolation(
+            f"customer {row['customer_phone']} was already messaged within the cooldown window -- refusing to send"
         )
 
     now_str = format_ts(now)

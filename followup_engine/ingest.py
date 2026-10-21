@@ -66,9 +66,11 @@ def _normalize_quote_row(row: object) -> dict | None:
         return None
     if row["status"] not in VALID_STATUSES:
         return None
-    if not isinstance(row["id"], str) or not row["id"]:
+    if not isinstance(row["id"], str) or not row["id"].strip():
         return None
     if not isinstance(row["customer_name"], str) or not row["customer_name"].strip():
+        return None
+    if not isinstance(row["tech_name"], str) or not row["tech_name"].strip():
         return None
     if not isinstance(row["amount"], (int, float)) or isinstance(row["amount"], bool) or row["amount"] < 0:
         return None

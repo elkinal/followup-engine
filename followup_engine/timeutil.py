@@ -30,7 +30,3 @@ def format_ts(dt: datetime) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     dt = dt.astimezone(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def utcnow_str() -> str:
-    return format_ts(datetime.now(timezone.utc))

@@ -3,3 +3,4 @@ __pycache__/
 followup.db
 followup.db-wal
 followup.db-shm
+.coverage
