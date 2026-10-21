@@ -152,60 +152,115 @@ def send(conn: sqlite3.Connection, message_id: str, now: datetime, channel: str 
     written for" (chosen in policy.py from the customer's own history --
     see QuoteSignals.preferred_channel). Pass an explicit channel only to
     override that choice for this particular send.
+
+    Everything from the guardrail re-checks through the outbox write runs
+    inside one `BEGIN IMMEDIATE` transaction. That's not just tidiness: the
+    cooldown check reads committed state and then writes based on what it
+    read, and under genuine concurrency (two real processes/threads calling
+    send() for two different messages to the *same* customer at the same
+    time) both could read "no recent contact" before either had written
+    anything -- a classic check-then-act race that let two real sends go
+    out to the same customer in testing. BEGIN IMMEDIATE acquires SQLite's
+    write lock up front, so a second concurrent send() blocks (via
+    busy_timeout) until the first fully commits, and then correctly sees
+    it. A quick cheap pre-check happens before the transaction too, so a
+    message that's obviously already sent or not yet approved fails fast
+    without taking a write lock for no reason.
     """
     row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
     if row is None:
         raise ValueError(f"no such message: {message_id}")
-
     if row["status"] == "sent":
         return SendResult(message_id=message_id, already_sent=True)
-
     if row["status"] not in ("approved", "failed"):
         raise GuardrailViolation(
             f"message {message_id} is '{row['status']}' -- must be 'approved' before sending"
         )
 
-    # Re-validate against current quote state: it may have changed (e.g. the
-    # customer accepted elsewhere) between draft creation and this send.
-    quote = conn.execute("SELECT status FROM quotes WHERE id = ?", (row["quote_id"],)).fetchone()
-    if quote is None or quote["status"] != "open":
-        conn.execute("UPDATE messages SET status = 'failed' WHERE id = ?", (message_id,))
-        conn.commit()
-        raise GuardrailViolation(
-            f"quote {row['quote_id']} is no longer open ({quote['status'] if quote else 'missing'}) -- refusing to send"
-        )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Re-read everything inside the lock: another concurrent send() for
+        # this exact message_id could have completed while we were waiting
+        # for the write lock above.
+        row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+        if row["status"] == "sent":
+            conn.rollback()
+            return SendResult(message_id=message_id, already_sent=True)
 
-    # Re-validate cooldown too: create_drafts() blocks a *new* draft to a
-    # phone that already has one outstanding, but two drafts for the same
-    # customer can still both reach 'approved' (e.g. from two separate
-    # draft-generation runs before either was sent). This is the
-    # authoritative check -- the one that actually gates the real outbound
-    # side effect -- mirroring the quote-status re-check above.
-    last_outbound = policy.last_outbound_by_phone(conn, now)
-    last_sent_to_this_phone = last_outbound.get(row["customer_phone"])
-    if last_sent_to_this_phone is not None and (now - last_sent_to_this_phone) < policy.COOLDOWN:
-        conn.execute("UPDATE messages SET status = 'failed' WHERE id = ?", (message_id,))
-        conn.commit()
-        raise GuardrailViolation(
-            f"customer {row['customer_phone']} was already messaged within the cooldown window -- refusing to send"
-        )
+        # Re-validate against current quote state: it may have changed
+        # (e.g. the customer accepted elsewhere) between draft creation and
+        # this send. Phone number is read live here too, not from the
+        # message's own snapshot -- if it's been corrected since the draft
+        # was written (e.g. a data fix, or the quote reassigned to a
+        # different customer record), sending to the stale number captured
+        # at draft time would be wrong, unlike every other guardrail here
+        # which deliberately checks current state.
+        quote = conn.execute(
+            "SELECT status, customer_phone FROM quotes WHERE id = ?", (row["quote_id"],)
+        ).fetchone()
+        if quote is None or quote["status"] != "open":
+            conn.execute("UPDATE messages SET status = 'failed' WHERE id = ?", (message_id,))
+            conn.commit()
+            raise GuardrailViolation(
+                f"quote {row['quote_id']} is no longer open "
+                f"({quote['status'] if quote else 'missing'}) -- refusing to send"
+            )
+        # quotes.status can lag the event stream (see
+        # policy.quote_accepted_via_events) -- check that independently too.
+        if policy.quote_accepted_via_events(conn, row["quote_id"], now):
+            conn.execute("UPDATE messages SET status = 'failed' WHERE id = ?", (message_id,))
+            conn.commit()
+            raise GuardrailViolation(
+                f"quote {row['quote_id']} was accepted per the event stream -- refusing to send"
+            )
+        customer_phone = quote["customer_phone"]
 
-    now_str = format_ts(now)
-    send_channel = channel if channel is not None else row["channel"]
-    # INSERT OR IGNORE on a PRIMARY KEY is the idempotency boundary: this is
-    # the one write that represents "a message actually went out", keyed by
-    # message_id so a retry of this exact call can never produce a second
-    # outbound send.
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO outbox (message_id, quote_id, customer_phone, channel, body, sent_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (message_id, row["quote_id"], row["customer_phone"], send_channel, row["body"], now_str),
-    )
-    conn.execute(
-        "UPDATE messages SET status = 'sent', sent_at = COALESCE(sent_at, ?) WHERE id = ? AND status != 'sent'",
-        (now_str, message_id),
-    )
-    conn.commit()
-    return SendResult(message_id=message_id, already_sent=False)
+        # Re-validate cooldown too: create_drafts() blocks a *new* draft to
+        # a phone that already has one outstanding, but two drafts for the
+        # same customer can still both reach 'approved' (e.g. from two
+        # separate draft-generation runs before either was sent). This is
+        # the authoritative check -- the one that actually gates the real
+        # outbound side effect -- mirroring the quote-status re-check above.
+        last_outbound = policy.last_outbound_by_phone(conn, now)
+        last_sent_to_this_phone = last_outbound.get(customer_phone)
+        if last_sent_to_this_phone is not None and (now - last_sent_to_this_phone) < policy.COOLDOWN:
+            conn.execute("UPDATE messages SET status = 'failed' WHERE id = ?", (message_id,))
+            conn.commit()
+            raise GuardrailViolation(
+                f"customer {customer_phone} was already messaged within the cooldown window -- refusing to send"
+            )
+
+        now_str = format_ts(now)
+        send_channel = channel if channel is not None else row["channel"]
+        try:
+            # INSERT OR IGNORE on a PRIMARY KEY is the idempotency boundary:
+            # this is the one write that represents "a message actually
+            # went out", keyed by message_id so a retry of this exact call
+            # can never produce a second outbound send.
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO outbox (message_id, quote_id, customer_phone, channel, body, sent_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (message_id, row["quote_id"], customer_phone, send_channel, row["body"], now_str),
+            )
+        except sqlite3.IntegrityError:
+            # block_send_for_non_open_quote trigger: a backstop that should
+            # be unreachable given the checks above now run in the same
+            # transaction, but caught cleanly rather than left to crash
+            # raw, consistent with how the equivalent triggers are handled
+            # in create_drafts()/approve().
+            conn.execute("UPDATE messages SET status = 'failed' WHERE id = ?", (message_id,))
+            conn.commit()
+            raise GuardrailViolation(
+                f"quote {row['quote_id']} is not open -- refusing to send"
+            )
+        conn.execute(
+            "UPDATE messages SET status = 'sent', sent_at = COALESCE(sent_at, ?) WHERE id = ? AND status != 'sent'",
+            (now_str, message_id),
+        )
+        conn.commit()
+        return SendResult(message_id=message_id, already_sent=False)
+    except BaseException:
+        conn.rollback()
+        raise

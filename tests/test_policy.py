@@ -154,5 +154,33 @@ class TestPreferredChannel(unittest.TestCase):
         self.assertEqual(channels(self.conn)["Q-1"], "sms")
 
 
+class TestQuoteAcceptedViaEvents(unittest.TestCase):
+    """Regression tests for a real gap found by code review: quotes.json's
+    `status` field is a batch/snapshot source that can lag the (closer to
+    real-time) event stream. A `quote_accepted` event -- a type the seed
+    data's own event stream names explicitly -- was parsed and stored by
+    ingest.py but never consulted by policy.py, so a quote the event stream
+    says was accepted could still surface as, and be sent, a follow-up."""
+
+    def setUp(self):
+        self.conn = make_db(self)
+
+    def test_quote_with_an_accepted_event_is_excluded_even_though_status_still_says_open(self):
+        insert_quote(self.conn, "Q-1", status="open", amount=10000, created_at="2026-08-01T00:00:00Z")
+        insert_event(self.conn, "e1", "quote_accepted", "Q-1", "2026-08-14T00:00:00Z")
+        self.assertNotIn("Q-1", reason_codes(self.conn))
+
+    def test_accepted_event_in_the_future_relative_to_now_does_not_exclude_it_yet(self):
+        insert_quote(self.conn, "Q-1", status="open", amount=10000, created_at="2026-08-01T00:00:00Z")
+        insert_event(self.conn, "e1", "quote_accepted", "Q-1", "2026-08-20T00:00:00Z")  # after NOW
+        self.assertIn("Q-1", reason_codes(self.conn))
+
+    def test_helper_function_directly(self):
+        insert_quote(self.conn, "Q-1", status="open", created_at="2026-08-01T00:00:00Z")
+        self.assertFalse(policy.quote_accepted_via_events(self.conn, "Q-1", NOW))
+        insert_event(self.conn, "e1", "quote_accepted", "Q-1", "2026-08-14T00:00:00Z")
+        self.assertTrue(policy.quote_accepted_via_events(self.conn, "Q-1", NOW))
+
+
 if __name__ == "__main__":
     unittest.main()

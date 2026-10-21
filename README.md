@@ -9,9 +9,13 @@ requires a human approve step before a (simulated) send. Python stdlib only
 
 Requires Python 3.11+ (uses `datetime.fromisoformat` with `Z` suffixes).
 
-```bash
-cd followup_engine
+Run every command below from this project's root directory -- the one
+directly containing this README and the `followup_engine/`, `seed/`, and
+`tests/` folders (however your checkout happens to be named; don't `cd`
+into the `followup_engine/` folder itself, since that's the Python package,
+one level too deep for `python3 -m` to find it):
 
+```bash
 # 1. Load the seed data into a local SQLite db (followup.db)
 python3 -m followup_engine.cli ingest
 
@@ -27,11 +31,12 @@ python3 -m followup_engine.cli draft --now 2026-08-16T00:00:00Z
 # 4. Review drafts
 python3 -m followup_engine.cli drafts --status draft
 
-# 5. Human approves, then sends (two separate, deliberate steps)
+# 5. Human approves, then sends (two separate, deliberate steps).
+#    Copy a real id from step 4's output in place of MESSAGE_ID below --
 #    approve defaults --by to your OS username; send defaults --channel to
 #    whichever channel the draft was written for (see "follow-up policy").
-python3 -m followup_engine.cli approve <message_id>
-python3 -m followup_engine.cli send <message_id>
+python3 -m followup_engine.cli approve MESSAGE_ID
+python3 -m followup_engine.cli send MESSAGE_ID
 
 # 6. See what actually went out
 python3 -m followup_engine.cli outbox
@@ -363,26 +368,89 @@ normally, and support needs a fast way to stop it without redeploying code.
   duplicate injection, missing fields) beyond the hand-written cases already
   in `tests/test_ingest.py`.
 
+### An adversarial review pass found a genuine concurrency bug
+
+I asked for (and ran) a structured, skeptical review aimed specifically at
+breaking the three named guardrails -- different orderings, repeated runs,
+state changing mid-flow, concurrent processes, and `quotes.json` vs. the
+event stream disagreeing -- with every claimed finding backed by an actual
+script against real data, not just reasoning about the code. It found one
+genuinely serious bug and three smaller real ones:
+
+- **Critical: the cooldown guardrail was bypassable under true concurrency.**
+  `send()`'s cooldown re-check reads committed state and then writes based
+  on what it read, across several separate statements. Two *real* OS
+  threads, each with their own connection to the same file, calling
+  `send()` for two different messages to the same customer at the same
+  time, could both read "no recent contact" before either had written
+  anything -- a textbook check-then-act race. Reproduced deterministically
+  by forcing the interleaving with a `threading.Barrier`: both sends
+  succeeded, two real outbox rows for the same customer. A contrasting test
+  against the *other* guardrail (one open draft per quote) -- the identical
+  attack shape -- held, because that one is backed by a real SQLite
+  `UNIQUE INDEX`, not just an app-level check. That contrast is the fix:
+  `send()` now wraps its guardrail re-checks and the outbox write in one
+  `BEGIN IMMEDIATE` transaction, so a second concurrent sender blocks (via
+  `busy_timeout`) until the first fully commits, then correctly sees it.
+  Verified with 10 trials of genuine concurrent threads (no artificial
+  synchronization) -- 1 outbox row every time, down from 2 before the fix.
+- **`quote_accepted` events were parsed, stored, and completely ignored.**
+  `quotes.json`'s `status` is a batch/snapshot field; a `quote_accepted`
+  event (a type the seed data's own stream names explicitly) can arrive
+  before a re-export catches up. A quote the event stream says was accepted
+  could still surface as a candidate and get sent to. Fixed with
+  `policy.quote_accepted_via_events()`, checked both when generating
+  candidates and, independently, inside `send()`'s own re-check -- the
+  event can arrive after approval too, not just before drafting.
+- **`send()` used a phone number snapshotted at draft time**, not the
+  current one. If a number is corrected between draft and send, the
+  message went to the stale number -- inconsistent with quote status
+  already being re-checked live at send time. Now reads the phone live too.
+- **A DB trigger firing at send time could crash raw.** The
+  `block_send_for_non_open_quote` trigger is a backstop for exactly the
+  race above; when it fired, the resulting `sqlite3.IntegrityError` wasn't
+  caught anywhere, so it would have surfaced as a traceback instead of a
+  clean guardrail message. Caught now, consistent with how the equivalent
+  triggers in `create_drafts()`/`approve()` are already handled. (The
+  `BEGIN IMMEDIATE` fix above also closes the specific race that used to
+  trigger this, but the catch stays in as a backstop for the backstop.)
+
+Also found, lower severity: the README's own run instructions broke for a
+checkout not literally named `followup_engine` (the repo root and the
+Python package inside it share that name, and `cd followup_engine` is
+ambiguous between them) -- confirmed by cloning into a differently-named
+directory and hitting `ModuleNotFoundError` on the very first command, and
+separately confirmed live when `<message_id>` in a copy-pasted command
+caused an actual shell parse error during manual testing. Both fixed: the
+README no longer tells you to `cd` into the package directory, and the
+placeholder no longer uses shell-special characters.
+
+All of this is covered by new tests (`TestConcurrentSendDoesNotBypassCooldown`,
+`TestSendUsesLiveQuoteState`, `TestQuoteAcceptedViaEvents`), 123 total.
+
 ## Where I stopped
 
 The initial MVP (ingest, policy, drafting, draft/approve/send, CLI, first
 pass of tests and README) was built to the stated ~3-hour scope in one
-sitting. Everything after that -- the three audit passes, the phone/channel/
-approver/concurrency additions, and the final coverage-and-correctness
-verification pass that found the cooldown bypass -- was additional,
-explicitly-requested work: I asked for rounds of adversarial self-review
-("double check the guardrails," "do another pass," "verify 100% that it
-works correctly"), and kept going back in. That's a different mode of work
-than the original time-boxed build, and it's why the project ended up more
-thoroughly audited than a strict 3-hour reading of the brief would produce
-on its own -- worth being upfront about, since the assignment is explicit
-that the time budget matters and I don't want the depth of the later passes
-to misrepresent how long the initial build actually took. I stopped where I
-did because the remaining items (listed above) are genuine next-iteration
-scope -- a real provider integration, draft editing, per-shop config, a web
-UI -- not loose ends in what's already here; the code, tests, and guardrails
-are in a state I'm prepared to defend as correct and complete against the
-brief.
+sitting. Everything after that -- several audit passes, the phone/channel/
+approver/concurrency additions, a coverage-and-correctness pass that found a
+*sequential* cooldown bypass (two separate `draft` runs before either was
+approved), and finally a structured adversarial review that found the
+*concurrent* one (two simultaneous `send()` calls) plus the ignored
+`quote_accepted` events -- was additional, explicitly-requested work: I
+asked for rounds of adversarial self-review ("double check the guardrails,"
+"do another pass," "verify 100% that it works correctly," a scripted
+skeptical-reviewer prompt), and kept going back in. That's a different mode
+of work than the original time-boxed build, and it's why the project ended
+up more thoroughly audited than a strict 3-hour reading of the brief would
+produce on its own -- worth being upfront about, since the assignment is
+explicit that the time budget matters and I don't want the depth of the
+later passes to misrepresent how long the initial build actually took. I
+stopped where I did because the remaining items (listed above) are genuine
+next-iteration scope -- a real provider integration, draft editing,
+per-shop config, a web UI -- not loose ends in what's already here; the
+code, tests, and guardrails are in a state I'm prepared to defend as
+correct and complete against the brief.
 
 ## Notes on AI use
 

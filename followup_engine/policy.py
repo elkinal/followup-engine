@@ -23,6 +23,12 @@ Design notes (see README for the fuller rationale):
   +19175552003 / Karen Nguyen). Texting that person about job A should count
   against texting her again about job B a few hours later -- the guardrail
   is "don't spam this human", not "don't spam this quote".
+- `quotes.status` is the primary source for "is this quote still open," but
+  it's a batch/snapshot field -- a `quote_accepted` event can arrive in the
+  (closer to real-time) event stream before a quotes.json re-export catches
+  up and flips `status`. quote_accepted_via_events() below checks the event
+  stream too, independent of `status`, so the two sources agreeing isn't an
+  assumption baked into every caller.
 """
 from __future__ import annotations
 
@@ -168,6 +174,19 @@ def last_outbound_by_phone(conn: sqlite3.Connection, now: datetime) -> dict[str,
     return result
 
 
+def quote_accepted_via_events(conn: sqlite3.Connection, quote_id: str, now: datetime) -> bool:
+    """True if a `quote_accepted` event exists for this quote at or before
+    `now`, independent of `quotes.status`. `quotes.json` can be a
+    batch/snapshot export that lags a more real-time event stream; a
+    customer who accepted per the event stream shouldn't keep getting
+    follow-ups just because that snapshot hasn't caught up yet."""
+    row = conn.execute(
+        "SELECT 1 FROM events WHERE quote_id = ? AND type = 'quote_accepted' AND timestamp <= ? LIMIT 1",
+        (quote_id, now.strftime("%Y-%m-%dT%H:%M:%SZ")),
+    ).fetchone()
+    return row is not None
+
+
 def _fmt_delta(delta: timedelta) -> str:
     hours = delta.total_seconds() / 3600
     if hours < 48:
@@ -246,6 +265,10 @@ def get_candidates(conn: sqlite3.Connection, now: datetime) -> list[Candidate]:
     quotes = conn.execute("SELECT * FROM quotes WHERE status = 'open'").fetchall()
     candidates = []
     for quote in quotes:
+        # quotes.status says 'open', but the event stream may be ahead of
+        # that batch field -- see quote_accepted_via_events() docstring.
+        if quote_accepted_via_events(conn, quote["id"], now):
+            continue
         sig = signals.get(quote["id"], QuoteSignals())
         candidate = evaluate_quote(quote, sig, now)
         if candidate is not None:

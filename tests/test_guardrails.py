@@ -1,7 +1,10 @@
 import sqlite3
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 
-from followup_engine import service
+from followup_engine import db, policy, service
 from followup_engine.timeutil import parse_ts
 from tests.helpers import insert_event, insert_quote, make_db
 
@@ -233,6 +236,120 @@ class TestCooldownIsAuthoritativeAtSendTime(unittest.TestCase):
         self.assertFalse(result.already_sent)
         count = self.conn.execute("SELECT count(*) FROM outbox").fetchone()[0]
         self.assertEqual(count, 2)
+
+
+class TestConcurrentSendDoesNotBypassCooldown(unittest.TestCase):
+    """Regression test for a real race found by code review: two genuinely
+    concurrent send() calls (real OS threads, real separate connections to
+    the same file) for two different messages to the same customer could
+    both read 'no recent contact' before either had written anything, and
+    both sends would go out. send() now wraps its guardrail re-checks and
+    the outbox write in one BEGIN IMMEDIATE transaction so a second
+    concurrent sender blocks until the first fully commits. This needs a
+    real file (not :memory:) and real threads -- the bug was specifically
+    about true concurrency, not sequential calls, which were already safe."""
+
+    def _run_trial(self, tmp_dir, trial):
+        path = str(Path(tmp_dir) / f"race_{trial}.db")
+        setup = db.connect(path)
+        phone = "+19175552003"
+        for qid in ("Q-A", "Q-B"):
+            setup.execute(
+                "INSERT INTO quotes (id, customer_name, customer_phone, tech_name, amount, status, created_at) "
+                "VALUES (?, 'Karen', ?, 'Jaden', 850, 'open', '2026-08-01T00:00:00Z')", (qid, phone),
+            )
+        for mid, qid in [("m-a", "Q-A"), ("m-b", "Q-B")]:
+            setup.execute(
+                "INSERT INTO messages (id, quote_id, customer_phone, reason_code, reason, body, "
+                "channel, status, created_at) VALUES (?, ?, ?, 'x', 'r', 'b', 'sms', 'draft', ?)",
+                (mid, qid, phone, "2026-08-16T00:00:00Z"),
+            )
+        setup.commit()
+        service.approve(setup, "m-a", NOW, approved_by="brad")
+        service.approve(setup, "m-b", NOW, approved_by="brad")
+        setup.close()
+
+        def worker(mid):
+            conn = db.connect(path)
+            try:
+                service.send(conn, mid, NOW)
+            except service.GuardrailViolation:
+                pass
+            conn.close()
+
+        t1 = threading.Thread(target=worker, args=("m-a",))
+        t2 = threading.Thread(target=worker, args=("m-b",))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        conn = db.connect(path)
+        count = conn.execute("SELECT count(*) FROM outbox").fetchone()[0]
+        conn.close()
+        return count
+
+    def test_only_one_of_two_concurrent_sends_to_the_same_customer_succeeds(self):
+        tmp_dir = tempfile.mkdtemp()
+        # Run several trials -- thread scheduling isn't deterministic, so a
+        # single pass passing wouldn't be convincing on its own.
+        for trial in range(10):
+            count = self._run_trial(tmp_dir, trial)
+            self.assertEqual(count, 1, f"trial {trial}: expected exactly 1 outbox row, got {count}")
+
+
+class TestSendUsesLiveQuoteState(unittest.TestCase):
+    """send() re-checks quote status at send time; it must use equally
+    live data for the phone number and for accepted-via-events, not a
+    snapshot taken when the draft was created."""
+
+    def setUp(self):
+        self.conn = make_db(self)
+
+    def test_phone_number_correction_after_draft_is_honored_at_send_time(self):
+        insert_quote(self.conn, "Q-1", amount=10000, created_at="2026-07-01T00:00:00Z", customer_phone="+19175551111")
+        r = service.create_drafts(self.conn, NOW)
+        mid = r.created[0]
+        self.conn.execute("UPDATE quotes SET customer_phone='+19175559999' WHERE id='Q-1'")
+        self.conn.commit()
+        service.approve(self.conn, mid, NOW, approved_by="brad")
+        service.send(self.conn, mid, NOW)
+        sent_to = self.conn.execute("SELECT customer_phone FROM outbox WHERE message_id=?", (mid,)).fetchone()[0]
+        self.assertEqual(sent_to, "+19175559999")
+
+    def test_quote_accepted_event_arriving_after_approval_blocks_the_send(self):
+        insert_quote(self.conn, "Q-1", amount=10000, created_at="2026-07-01T00:00:00Z")
+        r = service.create_drafts(self.conn, NOW)
+        mid = r.created[0]
+        service.approve(self.conn, mid, NOW, approved_by="brad")
+        # quotes.status is still 'open' -- only the event stream knows
+        insert_event(self.conn, "e1", "quote_accepted", "Q-1", "2026-08-16T00:30:00Z")
+        with self.assertRaises(service.GuardrailViolation):
+            service.send(self.conn, mid, parse_ts("2026-08-16T01:00:00Z"))
+        status = self.conn.execute("SELECT status FROM messages WHERE id=?", (mid,)).fetchone()["status"]
+        self.assertEqual(status, "failed")
+
+    def test_trigger_firing_at_send_time_raises_a_clean_guardrail_violation(self):
+        # Simulates the quote closing in the narrow window between send()'s
+        # own precheck and its outbox write -- the block_send_for_non_open_
+        # quote trigger fires, and must be caught, not crash raw.
+        insert_quote(self.conn, "Q-1", amount=10000, created_at="2026-07-01T00:00:00Z")
+        r = service.create_drafts(self.conn, NOW)
+        mid = r.created[0]
+        service.approve(self.conn, mid, NOW, approved_by="brad")
+
+        real_fn = policy.last_outbound_by_phone
+        def inject_race(c, n):
+            result = real_fn(c, n)
+            c.execute("UPDATE quotes SET status='accepted' WHERE id='Q-1'")
+            return result
+        policy.last_outbound_by_phone = inject_race
+        try:
+            with self.assertRaises(service.GuardrailViolation):
+                service.send(self.conn, mid, NOW)
+        finally:
+            policy.last_outbound_by_phone = real_fn
+        self.assertEqual(
+            self.conn.execute("SELECT count(*) FROM outbox").fetchone()[0], 0
+        )
 
 
 if __name__ == "__main__":
