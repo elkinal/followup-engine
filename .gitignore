@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 followup.db
+followup.db-wal
+followup.db-shm
