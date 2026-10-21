@@ -15,7 +15,13 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .timeutil import parse_ts
+from .timeutil import format_ts, parse_ts
+
+
+class IngestError(Exception):
+    """Raised for problems with the input itself (missing file, JSON that
+    doesn't even parse, wrong top-level shape) -- distinct from a single bad
+    row, which is skipped and logged rather than treated as fatal."""
 
 
 @dataclass
@@ -72,13 +78,42 @@ def _valid_quote_row(row: object) -> bool:
     return True
 
 
+def _load_json_list(path: str | Path, what: str) -> list:
+    try:
+        text = Path(path).read_text()
+    except FileNotFoundError:
+        raise IngestError(f"{what} file not found: {path}")
+    except OSError as e:
+        raise IngestError(f"could not read {what} file {path}: {e}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise IngestError(f"{what} file {path} is not valid JSON: {e}")
+    if not isinstance(data, list):
+        raise IngestError(f"{what} file {path} must contain a JSON array at the top level")
+    return data
+
+
 def ingest_quotes(conn: sqlite3.Connection, path: str | Path) -> IngestReport:
     report = IngestReport()
-    data = json.loads(Path(path).read_text())
+    data = _load_json_list(path, "quotes")
     for row in data:
         if not _valid_quote_row(row):
             report.quotes_skipped += 1
             continue
+        # Normalize to the canonical Z-suffixed UTC form before storing.
+        # Every timestamp comparison/ordering in policy.py is a SQL string
+        # comparison (`WHERE timestamp <= ?`, `ORDER BY timestamp`), which
+        # only agrees with chronological order if every stored row uses the
+        # exact same format -- a validly-parseable but differently-shaped
+        # timestamp (e.g. a "+08:00" offset instead of "Z") would otherwise
+        # sort incorrectly and silently corrupt signal computation.
+        last_contact = row.get("last_contact_at")
+        params = {
+            **row,
+            "created_at": format_ts(parse_ts(row["created_at"])),
+            "last_contact_at": format_ts(parse_ts(last_contact)) if last_contact is not None else None,
+        }
         try:
             conn.execute(
                 """
@@ -95,7 +130,7 @@ def ingest_quotes(conn: sqlite3.Connection, path: str | Path) -> IngestReport:
                     created_at=excluded.created_at,
                     last_contact_at=excluded.last_contact_at
                 """,
-                {**row, "last_contact_at": row.get("last_contact_at")},
+                params,
             )
         except sqlite3.IntegrityError:
             # Belt and suspenders: _valid_quote_row() should have already
@@ -113,7 +148,13 @@ def ingest_events(conn: sqlite3.Connection, path: str | Path, report: IngestRepo
     report = report or IngestReport()
     known_quote_ids = {r["id"] for r in conn.execute("SELECT id FROM quotes")}
 
-    with open(path) as f:
+    try:
+        f = open(path)
+    except FileNotFoundError:
+        raise IngestError(f"events file not found: {path}")
+    except OSError as e:
+        raise IngestError(f"could not read events file {path}: {e}")
+    with f:
         for lineno, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
@@ -139,13 +180,14 @@ def ingest_events(conn: sqlite3.Connection, path: str | Path, report: IngestRepo
                 )
                 continue
             try:
-                parse_ts(evt["timestamp"])
+                normalized_ts = format_ts(parse_ts(evt["timestamp"]))
             except (TypeError, ValueError):
                 report.events_skipped.append(
                     f"line {lineno}: unparseable timestamp {evt['timestamp']!r}"
                 )
                 continue
 
+            raw = json.dumps(evt, sort_keys=True)
             try:
                 cur = conn.execute(
                     """
@@ -157,10 +199,10 @@ def ingest_events(conn: sqlite3.Connection, path: str | Path, report: IngestRepo
                         evt["event_id"],
                         evt["type"],
                         evt["quote_id"],
-                        evt["timestamp"],
+                        normalized_ts,  # not the raw string -- see ingest_quotes() for why
                         evt.get("channel"),
                         evt.get("direction"),
-                        json.dumps(evt, sort_keys=True),
+                        raw,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -170,7 +212,24 @@ def ingest_events(conn: sqlite3.Connection, path: str | Path, report: IngestRepo
             if cur.rowcount == 1:
                 report.events_inserted += 1
             else:
-                report.events_duplicate += 1
+                # event_id already existed. An event_id is only supposed to
+                # be reused for a byte-identical redelivery of the same
+                # event (the "duplicate webhook" scenario this is meant to
+                # handle) -- if the content actually differs, this is two
+                # different events colliding on one id, which would
+                # otherwise silently vanish into the "duplicate" count with
+                # no trace. Surface it instead of guessing which one is
+                # right; we keep whichever arrived first.
+                existing_raw = conn.execute(
+                    "SELECT raw FROM events WHERE event_id = ?", (evt["event_id"],)
+                ).fetchone()[0]
+                if existing_raw == raw:
+                    report.events_duplicate += 1
+                else:
+                    report.events_skipped.append(
+                        f"line {lineno}: event_id {evt['event_id']!r} reused for different "
+                        f"content -- ignored, kept the first version seen"
+                    )
     conn.commit()
     return report
 

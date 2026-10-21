@@ -147,8 +147,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         args.func(args)
-    except (service.GuardrailViolation, ValueError) as e:
+    except (service.GuardrailViolation, ValueError, ingest.IngestError) as e:
         print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except sqlite3.OperationalError as e:
+        print(f"error: could not open database {args.db!r}: {e}", file=sys.stderr)
         sys.exit(1)
 
 

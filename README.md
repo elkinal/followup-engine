@@ -156,6 +156,38 @@ which I fixed and backed with tests (`test_db_constraints.py`,
   as schema-level triggers (see above) so it's structurally impossible, not
   just checked.
 
+A second audit pass (prompted by explicitly going looking for more) found a
+subtler correctness bug plus more CLI robustness gaps:
+
+- **Timestamps were stored un-normalized, and every ordering/filter in
+  `policy.py` is a raw SQL string comparison** (`WHERE timestamp <= ?`,
+  `ORDER BY timestamp`). A validly-parseable timestamp in a non-`Z` form
+  (e.g. a `+08:00` offset) was stored as-is; its string sort order doesn't
+  match its real chronological position, so an event could silently vanish
+  from signal computation even though it parsed correctly. My first-pass fix
+  (accept anything `parse_ts` can parse) actually made this worse by letting
+  non-canonical formats into storage. Fixed by normalizing every timestamp
+  to the canonical `Z`-suffixed UTC string at ingest time, before it's
+  written -- confirmed with a repro where an event at the real boundary of
+  "now" was being dropped, then re-verified it's found after the fix.
+- **An `event_id` reused for genuinely different event content was silently
+  absorbed into the "duplicate" count.** The dedup logic was only designed
+  for byte-identical webhook redelivery; a collision between two *different*
+  events sharing an id (which should never happen, but nothing checked)
+  would make the second one disappear with no trace. Now compared against
+  the stored content: true duplicates still count as duplicates, but a
+  content mismatch is surfaced in `events_skipped` instead.
+- **Several CLI failure paths leaked raw Python tracebacks**: a missing
+  `quotes.json`/`events.jsonl`, a `--db` path whose parent directory doesn't
+  exist, and a `quotes.json` whose top-level JSON isn't a list. `ingest.py`
+  now raises a dedicated `IngestError` for input-shape problems (distinct
+  from a single bad row, which is still skipped and logged), and `cli.py`
+  catches that plus `sqlite3.OperationalError` alongside the existing
+  guardrail/value errors.
+- Backfilled test coverage that didn't exist for `cli.py` at all
+  (`test_cli.py`: clean-error-message tests plus a full ingest -> draft ->
+  approve -> send -> outbox run through the actual CLI entry point).
+
 Found but **not** fixed, since they're either out of scope for an MVP or
 need a product decision I can't make unilaterally:
 
