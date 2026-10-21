@@ -363,6 +363,27 @@ normally, and support needs a fast way to stop it without redeploying code.
   duplicate injection, missing fields) beyond the hand-written cases already
   in `tests/test_ingest.py`.
 
+## Where I stopped
+
+The initial MVP (ingest, policy, drafting, draft/approve/send, CLI, first
+pass of tests and README) was built to the stated ~3-hour scope in one
+sitting. Everything after that -- the three audit passes, the phone/channel/
+approver/concurrency additions, and the final coverage-and-correctness
+verification pass that found the cooldown bypass -- was additional,
+explicitly-requested work: I asked for rounds of adversarial self-review
+("double check the guardrails," "do another pass," "verify 100% that it
+works correctly"), and kept going back in. That's a different mode of work
+than the original time-boxed build, and it's why the project ended up more
+thoroughly audited than a strict 3-hour reading of the brief would produce
+on its own -- worth being upfront about, since the assignment is explicit
+that the time budget matters and I don't want the depth of the later passes
+to misrepresent how long the initial build actually took. I stopped where I
+did because the remaining items (listed above) are genuine next-iteration
+scope -- a real provider integration, draft editing, per-shop config, a web
+UI -- not loose ends in what's already here; the code, tests, and guardrails
+are in a state I'm prepared to defend as correct and complete against the
+brief.
+
 ## Notes on AI use
 
 Built with Claude Code. The full conversation transcript is included per the
