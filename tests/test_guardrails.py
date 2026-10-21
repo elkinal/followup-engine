@@ -296,6 +296,65 @@ class TestConcurrentSendDoesNotBypassCooldown(unittest.TestCase):
             self.assertEqual(count, 1, f"trial {trial}: expected exactly 1 outbox row, got {count}")
 
 
+class TestSendIsTheAuthoritativeGateEvenIfDraftingItselfRaces(unittest.TestCase):
+    """create_drafts() is deliberately NOT wrapped in its own BEGIN IMMEDIATE
+    (unlike send()) -- it's a convenience step, not the function with the
+    real side effect, so its own cooldown check can still race under true
+    concurrency and produce two open drafts for the same customer. That's
+    accepted as a known, lower-severity gap (wasted human review time, not a
+    safety violation) *because* send() is proven here to catch it: no matter
+    how many conflicting drafts exist or get approved, at most one can ever
+    actually be sent."""
+
+    def test_two_drafts_created_by_a_racing_create_drafts_still_only_allow_one_send(self):
+        tmp_dir = tempfile.mkdtemp()
+        path = str(Path(tmp_dir) / "draft_race.db")
+        setup = db.connect(path)
+        phone = "+19175552003"
+        insert_quote(setup, "Q-A", customer_phone=phone, amount=10000, created_at="2026-07-01T00:00:00Z")
+        insert_quote(setup, "Q-B", customer_phone=phone, amount=10000, created_at="2026-07-01T00:00:00Z")
+        setup.close()
+        now = parse_ts("2026-08-16T00:00:00Z")
+
+        # Force the race in create_drafts() itself, same technique as above.
+        barrier = threading.Barrier(2)
+        real_fn = policy.get_candidates
+
+        def racy_get_candidates(conn, now):
+            result = real_fn(conn, now)
+            barrier.wait(timeout=5)
+            return result
+
+        policy.get_candidates = racy_get_candidates
+        try:
+            def draft_worker():
+                conn = db.connect(path)
+                service.create_drafts(conn, now)
+                conn.close()
+
+            t1 = threading.Thread(target=draft_worker)
+            t2 = threading.Thread(target=draft_worker)
+            t1.start(); t2.start()
+            t1.join(); t2.join()
+        finally:
+            policy.get_candidates = real_fn
+
+        conn = db.connect(path)
+        drafts = conn.execute("SELECT id, quote_id FROM messages WHERE status='draft'").fetchall()
+        self.assertEqual(len(drafts), 2, "the race should have produced two conflicting drafts")
+
+        # Worst case: a human approves and sends both without noticing.
+        for mid, _qid in drafts:
+            service.approve(conn, mid, now, approved_by="brad")
+            try:
+                service.send(conn, mid, now)
+            except service.GuardrailViolation:
+                pass
+
+        outbox_count = conn.execute("SELECT count(*) FROM outbox").fetchone()[0]
+        self.assertEqual(outbox_count, 1, "send() must refuse the second one no matter what create_drafts() did")
+
+
 class TestSendUsesLiveQuoteState(unittest.TestCase):
     """send() re-checks quote status at send time; it must use equally
     live data for the phone number and for accepted-via-events, not a

@@ -394,6 +394,13 @@ genuinely serious bug and three smaller real ones:
   `busy_timeout`) until the first fully commits, then correctly sees it.
   Verified with 10 trials of genuine concurrent threads (no artificial
   synchronization) -- 1 outbox row every time, down from 2 before the fix.
+  `create_drafts()` itself is deliberately left *not* atomic (it's a
+  convenience step, not the function with the real side effect) -- proven
+  safe anyway: forced the same race in `create_drafts()`, producing two
+  real conflicting drafts, then approved and sent both as a human
+  blindly-approving-everything worst case would. `send()` still refused
+  the second one every time. One function being the actual, provably
+  atomic gate matters more than every step before it also being atomic.
 - **`quote_accepted` events were parsed, stored, and completely ignored.**
   `quotes.json`'s `status` is a batch/snapshot field; a `quote_accepted`
   event (a type the seed data's own stream names explicitly) can arrive
