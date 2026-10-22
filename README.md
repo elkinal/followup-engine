@@ -86,25 +86,22 @@ self-tune.
 
 ## Scaling to a parent company with 50 shops
 
-Data and policy both need to become per-shop instead of shared. Every
-quote, event, and customer needs a `shop_id`, and every query in
-`policy.py` needs to filter by it, so one shop's customers and phone
-numbers never leak into another's results. Shops also disagree on what
-"follow up" means: one owner wants same-day texts, another thinks that's
-pushy and waits 5 days, a third skips SMS entirely. So the cooldown
-length, the stale-day windows, and the "big quote" cutoff should become
-per-shop settings instead of one fixed value for everyone. The three
-safety guardrails (never message an accepted or dismissed quote, cooldown,
-no double-send) stay fixed though. Those protect customers, not
-preferences, so no shop config should be able to turn them off.
+Data and policy need to become per-shop, not shared. Every quote, event,
+and customer needs a `shop_id`, and every query needs to filter by it.
+Otherwise one shop's customers and phone numbers leak into another's
+results. Shops also disagree on what "follow up" means. One wants same-day
+texts, another waits 5 days and calls that polite, a third skips SMS
+entirely. So cooldown length, stale-day windows, and the "big quote"
+cutoff should become per-shop settings, not one fixed value for everyone.
+The three safety guardrails stay fixed for every shop though. They protect
+customers, not preferences, so no shop config can turn them off.
 
-Operationally, more shops means more moving parts. SQLite can't handle 50
-shops writing at once, so this needs a real database built for multiple
-writers. Approving messages can't stay one person clicking through a
-terminal either: it needs a real screen that shows who approved what,
-scoped to their own shop. And support needs a kill switch to pause one
-shop's sends instantly, without touching the other 49 or waiting on a new
-deploy.
+More shops also means more moving parts operationally. SQLite can't handle
+50 shops writing at once, so this needs a real multi-writer database.
+Approving messages can't stay one person clicking through a terminal
+either. It needs a screen that shows who approved what, scoped to their
+shop. And support needs a kill switch to pause one shop's sends instantly,
+without touching the other 49.
 
 ## What I'd build next, and where I stopped
 
