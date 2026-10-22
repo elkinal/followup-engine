@@ -86,33 +86,25 @@ self-tune.
 
 ## Scaling to a parent company with 50 shops
 
-The biggest change isn't technical capacity, it's that "customer," "quote,"
-and "follow up" stop being company-wide concepts and become per-shop
-configuration. Phone numbers and event streams would need a `shop_id` (or
-`tenant_id`) on every row, including in the event stream itself, and every
-query in `policy.py` would need to scope by it, not just for correctness,
-but because a shop's customer list, its outbound phone number, and its
-message templates have to stay isolated from the other 49. More
-interestingly, "what follow up means" is explicitly called out as varying by
-shop: one owner wants aggressive same-day nudges, another thinks a text
-within 48h is pushy and prefers a 5-day cadence, and a third doesn't do SMS
-at all. That argues for pulling the current hardcoded constants in
-`policy.py` (cooldown, stale-day thresholds, the big-quote dollar cutoff,
-even which rules are enabled) into a per-shop policy config, with sane
-company-wide defaults a shop can override, while keeping the guardrails
-(never message accepted/dismissed, cooldown, no double-send) as
-non-negotiable platform-level invariants that no shop config can weaken,
-since those are safety properties, not preferences.
+Data and policy both need to become per-shop instead of shared. Every
+quote, event, and customer needs a `shop_id`, and every query in
+`policy.py` needs to filter by it, so one shop's customers and phone
+numbers never leak into another's results. Shops also disagree on what
+"follow up" means: one owner wants same-day texts, another thinks that's
+pushy and waits 5 days, a third skips SMS entirely. So the cooldown
+length, the stale-day windows, and the "big quote" cutoff should become
+per-shop settings instead of one fixed value for everyone. The three
+safety guardrails (never message an accepted or dismissed quote, cooldown,
+no double-send) stay fixed though. Those protect customers, not
+preferences, so no shop config should be able to turn them off.
 
-The second-order change is operational. With 50 shops producing events
-concurrently, SQLite's single-writer model stops being adequate, and the
-"approve" step stops being one owner eyeballing a terminal: it needs to be
-a real multi-user surface (who approved what, per-shop visibility, an audit
-trail of drafts that were edited or rejected, not just sent). I'd also want
-per-shop rate limits and a kill switch (pause all sends for shop X) as
-first-class operations, since a bug in one shop's policy config shouldn't
-spam that shop's customers while the other 49 keep running normally, and
-support needs a fast way to stop it without redeploying code.
+Operationally, more shops means more moving parts. SQLite can't handle 50
+shops writing at once, so this needs a real database built for multiple
+writers. Approving messages can't stay one person clicking through a
+terminal either: it needs a real screen that shows who approved what,
+scoped to their own shop. And support needs a kill switch to pause one
+shop's sends instantly, without touching the other 49 or waiting on a new
+deploy.
 
 ## What I'd build next, and where I stopped
 
